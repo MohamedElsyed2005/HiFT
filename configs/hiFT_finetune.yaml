@@ -1,0 +1,107 @@
+META_ARC: "HiFT_alexnet_aic4"
+CUDA: True
+
+TRAIN:
+  THR_HIGH: 0.6
+  THR_LOW: 0.3
+  NEG_NUM: 16
+  POS_NUM: 16
+  TOTAL_NUM: 64
+  CLS_WEIGHT: 1.0
+  LOC_WEIGHT: 3.0
+  SHAPE_WEIGHT: 2.0
+  EXEMPLAR_SIZE: 127
+  SEARCH_SIZE: 287
+  OUTPUTFEATURE_SIZE: 11
+  LABEL_RANGE: 4
+  BASE_SIZE: 8
+  OUTPUT_SIZE: 21
+  RESUME: ''
+  PRETRAINED: 1
+  LARGER: 2.0
+  LOG_DIR: './logs'
+  SNAPSHOT_DIR: './snapshot'
+  EPOCH: 15
+  START_EPOCH: 0
+  BATCH_SIZE: 4
+  NUM_GPU: 1
+  NUM_WORKERS: 1
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 0.0001
+  BASE_LR: 0.001
+  LR:
+    TYPE: 'log'
+    KWARGS:
+      start_lr: 0.001
+      end_lr: 1e-4
+  LR_WARMUP:
+    WARMUP: True
+    TYPE: 'step'
+    EPOCH: 3
+  PRINT_FREQ: 20
+  GRAD_CLIP: 10.0
+  # ✅ FIXED: Proper YAML syntax (multi-line, not semicolons)
+  w1: 1.0
+  w2: 1.0
+  w3: 1.0
+  w4: 1.0
+  w5: 1.0
+  range: 2.0
+  MASK_WEIGHT: 1
+  LOG_GRADS: False
+  clsandlocchannel: 256
+  groupchannel: 32
+  PR: 1
+
+DATASET:
+  NAMES: ['AIC4']  # ✅ Use list syntax
+  NEG: 0.2
+  GRAY: 0.0
+  TEMPLATE:
+    SHIFT: 4
+    SCALE: 0.05
+    BLUR: 0.0
+    FLIP: 0.0
+    COLOR: 1.0
+  SEARCH:
+    SHIFT: 64
+    SCALE: 0.18
+    BLUR: 0.0
+    FLIP: 0.0
+    COLOR: 1.0
+  AIC4:
+    ROOT: 'data/processed/crop511'
+    ANNO: 'data/processed/train.json'
+    FRAME_RANGE: 50
+    NUM_USE: 100000
+  VIDEOS_PER_EPOCH: 20000
+
+BACKBONE:
+  TYPE: 'alexnet'
+  PRETRAINED: 'pretrained/first.pth'
+  TRAIN_LAYERS: ['layer4', 'layer5']
+  LAYERS_LR: 0.1
+  TRAIN_EPOCH: 10
+
+ANCHOR:
+  STRIDE: 16
+
+TRACK:
+  TYPE: 'HiFTtracker'
+  PENALTY_K: 0.04
+  WINDOW_INFLUENCE: 0.44
+  LR: 0.4
+  w1: 1.2
+  w2: 1.0
+  w3: 1.6
+  LARGER: 1.4
+  EXEMPLAR_SIZE: 127
+  INSTANCE_SIZE: 255
+  BASE_SIZE: 8
+  STRIDE: 8
+  CONTEXT_AMOUNT: 0.5
+  LOST_INSTANCE_SIZE: 831
+  CONFIDENCE_LOW: 0.85
+  CONFIDENCE_HIGH: 0.998
+  MASK_THERSHOLD: 0.30
+  MASK_OUTPUT_SIZE: 127

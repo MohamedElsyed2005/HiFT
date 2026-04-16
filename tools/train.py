@@ -1,275 +1,229 @@
-# Copyright (c) SenseTime. All Rights Reserved.
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-import gc
-import argparse
-import logging
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+HiFT Fine-Tuning Script with Automatic 'Best Model' Saving
+"""
+# Add this after your imports to fix path issues
 import os
-import time
-import math
-import json
-import random
-import numpy as np
+import sys
 
+# Get the absolute path to the project root (parent of 'tools')
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Update default config path to be absolute
+DEFAULT_CFG = os.path.join(PROJECT_ROOT, 'configs', 'hiFT_finetune.yaml')
+
+
+import time
+import datetime
+import signal
+import logging
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
-from torch.nn.utils import clip_grad_norm_
-from torch.utils.data.distributed import DistributedSampler
 
-from pysot.utils.lr_scheduler import build_lr_scheduler
-from pysot.utils.log_helper import init_log, print_speed, add_file_handler
-from pysot.utils.distributed import dist_init, reduce_gradients,\
-        average_reduce, get_rank, get_world_size
-from pysot.utils.model_load import load_pretrain, restore_from
-from pysot.utils.average_meter import AverageMeter
-from pysot.utils.misc import describe, commit
-from pysot.models.model_builder import ModelBuilder
+# Add project root to python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from pysot.datasets.dataset import TrkDataset
 from pysot.core.config import cfg
+from pysot.models.model_builder import ModelBuilder
+from pysot.datasets.dataset import TrkDataset
+from pysot.utils.lr_scheduler import build_lr_scheduler
+from pysot.utils.log_helper import init_log, add_file_handler
+from pysot.utils.model_load import load_pretrain, restore_from
+from pysot.utils.distributed import dist_init
 
 
-logger = logging.getLogger('global')
-parser = argparse.ArgumentParser(description='HiFT tracking')
-parser.add_argument('--cfg', type=str, default='../experiments/config.yaml',
-                    help='configuration of tracking')
-parser.add_argument('--seed', type=int, default=123456,
-                    help='random seed')
-parser.add_argument('--local_rank', type=int, default=0,
-                    help='compulsory for pytorch launcer')
-args = parser.parse_args()
+# ROBUST LOGGER SETUP (fixes Spyder 'NoneType' issue)
+def get_logger(name='global', level=logging.INFO):
+    """Get or create a logger that works in any environment"""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        # Logger not yet configured
+        logger.setLevel(level)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+logger = get_logger('global', logging.INFO)
 
 
-def seed_torch(seed=0):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+def parse_args():
+    parser = argparse.ArgumentParser(description='HiFT Fine-tuning')
+    parser.add_argument('--cfg', type=str, default=DEFAULT_CFG, help='config file')
+    parser.add_argument('--resume', type=str, default=None, help='path to specific checkpoint to resume from')
+    return parser.parse_args()
 
+class SafeTrainer:
+    def __init__(self, model, optimizer, cfg):
+        self.model = model
+        self.optimizer = optimizer
+        self.cfg = cfg
+        self.save_dir = cfg.TRAIN.SNAPSHOT_DIR
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.interrupted = False
 
-def build_data_loader():
-    logger.info("build train dataset")
-    # train_dataset
-    train_dataset = TrkDataset()
-    logger.info("build dataset done")
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
 
-    train_sampler = None
-    if get_world_size() > 1:
-        train_sampler = DistributedSampler(train_dataset)
-    train_loader = DataLoader(train_dataset,
-                              batch_size=cfg.TRAIN.BATCH_SIZE,
-                              num_workers=cfg.TRAIN.NUM_WORKERS, 
-                              pin_memory=True,
-                              sampler=train_sampler)
-    return train_loader
+    def _handle_signal(self, signum, frame):
+        logger.warning("\n Interrupt received! Saving current state before exit...")
+        self.interrupted = True
 
-
-def build_opt_lr(model, current_epoch=0):
-    if current_epoch >= cfg.BACKBONE.TRAIN_EPOCH:
-        for layer in cfg.BACKBONE.TRAIN_LAYERS:
-            for param in getattr(model.backbone, layer).parameters():
-                param.requires_grad = True
-            for m in getattr(model.backbone, layer).modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
-    else:
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-        for m in model.backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    trainable_params = []
-    trainable_params += [{'params': filter(lambda x: x.requires_grad,
-                                            model.backbone.parameters()),
-                          'lr': cfg.BACKBONE.LAYERS_LR * cfg.TRAIN.BASE_LR}]
-
-    trainable_params += [{'params': model.grader.parameters(),
-                          'lr': cfg.TRAIN.BASE_LR}]
-    
-    optimizer = torch.optim.SGD(trainable_params,
-                                momentum=cfg.TRAIN.MOMENTUM,
-                                weight_decay=cfg.TRAIN.WEIGHT_DECAY)
-
-    lr_scheduler = build_lr_scheduler(optimizer, epochs=cfg.TRAIN.EPOCH)
-    lr_scheduler.step(cfg.TRAIN.START_EPOCH)
-    return optimizer, lr_scheduler
-
-
-def train(train_loader, model, optimizer, lr_scheduler, tb_writer):
-    cur_lr = lr_scheduler.get_cur_lr()
-    rank = get_rank()
-
-    average_meter = AverageMeter()
-
-    def is_valid_number(x):
-        return not(math.isnan(x) or math.isinf(x) or x > 1e4)
-
-    world_size = get_world_size()
-    num_per_epoch = len(train_loader.dataset) // \
-        cfg.TRAIN.EPOCH // (cfg.TRAIN.BATCH_SIZE * world_size)
-    start_epoch = cfg.TRAIN.START_EPOCH
-    epoch = start_epoch
-
-    if not os.path.exists(cfg.TRAIN.SNAPSHOT_DIR) and \
-            get_rank() == 0:
-        os.makedirs(cfg.TRAIN.SNAPSHOT_DIR)
-
-    logger.info("model\n{}".format(describe(model.module)))
-    end = time.time()
-    for idx, data in enumerate(train_loader):
-        if epoch != idx // num_per_epoch + start_epoch:
-            epoch = idx // num_per_epoch + start_epoch
-
-            if get_rank() == 0:
-                torch.save(
-                        {'epoch': epoch,
-                          'state_dict': model.module.state_dict(),
-                          'optimizer': optimizer.state_dict()},
-                        cfg.TRAIN.SNAPSHOT_DIR+'/checkpoint00_e%d.pth' % (epoch))
-               
-            if epoch == cfg.TRAIN.EPOCH:
-                
-                return
-
-            if cfg.BACKBONE.TRAIN_EPOCH == epoch:
-                logger.info('start training backbone.')
-                optimizer, lr_scheduler = build_opt_lr(model.module, epoch)
-                logger.info("model\n{}".format(describe(model.module)))
-
-            lr_scheduler.step(epoch)
-            cur_lr = lr_scheduler.get_cur_lr()
-            logger.info('epoch: {}'.format(epoch+1))
-
-        tb_idx = idx
-        if idx % num_per_epoch == 0 and idx != 0:
-            for idx, pg in enumerate(optimizer.param_groups):
-                logger.info('epoch {} lr {}'.format(epoch+1, pg['lr']))
-                if rank == 0:
-                    tb_writer.add_scalar('lr/group{}'.format(idx+1),
-                                          pg['lr'], tb_idx)
-
-        data_time = average_reduce(time.time() - end)
-        if rank == 0:
-            tb_writer.add_scalar('time/data', data_time, tb_idx)
-
-        outputs = model(data)
-        loss = outputs['total_loss'].mean()
-        if is_valid_number(loss.data.item()):
-            optimizer.zero_grad()
-            loss.backward()
-            reduce_gradients(model)
-
-            # clip gradient
-            clip_grad_norm_(model.parameters(), cfg.TRAIN.GRAD_CLIP)
-            optimizer.step()
-
-        batch_time = time.time() - end
-        batch_info = {}
-        batch_info['batch_time'] = average_reduce(batch_time)
-        batch_info['data_time'] = average_reduce(data_time)
-        for k, v in sorted(outputs.items()):
-            batch_info[k] = average_reduce(v.mean().data.item())
-
-        average_meter.update(**batch_info)
-
-        if rank == 0:
-            for k, v in batch_info.items():
-                tb_writer.add_scalar(k, v, tb_idx)
-
-            if (idx+1) % cfg.TRAIN.PRINT_FREQ == 0:
-                info = "Epoch: [{}][{}/{}] lr: {:.6f}\n".format(
-                            epoch+1, (idx+1) % num_per_epoch,
-                            num_per_epoch, cur_lr)
-                for cc, (k, v) in enumerate(batch_info.items()):
-                    if cc % 2 == 0:
-                        info += ("\t{:s}\t").format(
-                                getattr(average_meter, k))
-                    else:
-                        info += ("{:s}\n").format(
-                                getattr(average_meter, k))
-                logger.info(info)
-                print_speed(idx+1+start_epoch*num_per_epoch,
-                            average_meter.batch_time.avg,
-                            cfg.TRAIN.EPOCH * num_per_epoch)
-        end = time.time()
+    def save_checkpoint(self, epoch, filename, is_best=False):
+        state = {
+            'epoch': epoch,
+            'state_dict': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'cfg': self.cfg
+        }
+        path = os.path.join(self.save_dir, filename)
+        torch.save(state, path)
+        logger.info(f" Saved checkpoint: {path}")
         
-
-
+        if is_best:
+            best_path = os.path.join(self.save_dir, 'best.pth')
+            torch.save(state, best_path)
+            logger.info(f" New BEST model saved to: {best_path}")
 
 def main():
-    rank, world_size = dist_init()
-    # rank = 0
-    logger.info("init done")
-
-    # load cfg
+    args = parse_args()
     cfg.merge_from_file(args.cfg)
     
-    if rank == 0:
-        if not os.path.exists(cfg.TRAIN.LOG_DIR):
-            os.makedirs(cfg.TRAIN.LOG_DIR)
-        init_log('global', logging.INFO)
-        if cfg.TRAIN.LOG_DIR:
-            add_file_handler('global',
-                              os.path.join(cfg.TRAIN.LOG_DIR, 'logs.txt'),
-                              logging.INFO)
-
-        logger.info("Version Information: \n{}\n".format(commit()))
-        logger.info("config \n{}".format(json.dumps(cfg, indent=4)))
-
-    # create model
-    model = ModelBuilder().train()
-    dist_model = nn.DataParallel(model).cuda()
-
-    # load pretrained backbone weights
-    if cfg.BACKBONE.PRETRAINED:
-        cur_path = os.path.dirname(os.path.realpath(__file__))
-        backbone_path = os.path.join(cur_path, '../pretrained_models/', cfg.BACKBONE.PRETRAINED)
-        load_pretrain(model.backbone, backbone_path)
-
-    # create tensorboard writer
-    if rank == 0 and cfg.TRAIN.LOG_DIR:
-        tb_writer = SummaryWriter(cfg.TRAIN.LOG_DIR)
-    else:
-        tb_writer = None
-
-    # build dataset loader
-    train_loader = build_data_loader()
-
-    # build optimizer and lr_scheduler
-    optimizer, lr_scheduler = build_opt_lr(dist_model.module,
-                                            cfg.TRAIN.START_EPOCH)
-
-    # resume training
-    if cfg.TRAIN.RESUME:
-        logger.info("resume from {}".format(cfg.TRAIN.RESUME))
-        assert os.path.isfile(cfg.TRAIN.RESUME), \
-            '{} is not a valid file.'.format(cfg.TRAIN.RESUME)
-        model, optimizer, cfg.TRAIN.START_EPOCH = \
-            restore_from(model, optimizer, cfg.TRAIN.RESUME)
-    # load pretrain
-    elif cfg.TRAIN.PRETRAINED:
-        cur_path = os.path.dirname(os.path.realpath(__file__))
-        model_path = os.path.join(cur_path, '../pretrained_models/')
-        load_pretrain(model, model_path)               
+    # Setup logging directory
+    os.makedirs(cfg.TRAIN.LOG_DIR, exist_ok=True)
+    try:
+        add_file_handler('global', os.path.join(cfg.TRAIN.LOG_DIR, 'train.log'))
+    except:
+        pass  # Skip if handler already exists
     
-    dist_model = nn.DataParallel(model)
+    logger.info(f"Config loaded from {args.cfg}")
+    logger.info(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
-    logger.info(lr_scheduler)
-    logger.info("model prepare done")
+    # Init distributed
+    rank, world_size = dist_init()
+    
+    # 1. Build Model
+    logger.info("Building Model...")
+    model = ModelBuilder()
+    
+    # 2. Setup Optimizer
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = list(model.grader.parameters())
+    optimizer = torch.optim.SGD([
+        {'params': backbone_params, 'lr': cfg.BACKBONE.LAYERS_LR * cfg.TRAIN.BASE_LR},
+        {'params': head_params, 'lr': cfg.TRAIN.BASE_LR}
+    ], momentum=cfg.TRAIN.MOMENTUM, weight_decay=cfg.TRAIN.WEIGHT_DECAY)
+    
+    # 3. Resume Logic
+    start_epoch = 0
+    resume_path = args.resume or os.path.join(cfg.TRAIN.SNAPSHOT_DIR, 'latest.pth')
+    
+    if os.path.exists(resume_path):
+        logger.info(f" Resuming from: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location='cuda')
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch'] + 1
+        logger.info(f" Resumed successfully. Starting from Epoch {start_epoch}")
+    elif cfg.BACKBONE.PRETRAINED and os.path.exists(cfg.BACKBONE.PRETRAINED):
+        load_pretrain(model.backbone, cfg.BACKBONE.PRETRAINED)
+        logger.info(f"Loaded backbone weights from {cfg.BACKBONE.PRETRAINED}")
+        
+    lr_scheduler = build_lr_scheduler(optimizer, epochs=cfg.TRAIN.EPOCH, last_epoch=start_epoch - 1)
+    
+    # 4. Load Dataset
+    logger.info("Loading Dataset...")
+    dataset = TrkDataset()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.TRAIN.BATCH_SIZE,
+        num_workers=cfg.TRAIN.NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True
+    )
+    logger.info(f"Dataset ready: {len(dataset)} samples | Batch size: {cfg.TRAIN.BATCH_SIZE}")
+    
+    trainer = SafeTrainer(model, optimizer, cfg)
+    total_epochs = cfg.TRAIN.EPOCH
+    best_loss = float('inf')
+    
+    logger.info(f" Starting fine-tuning: Epoch {start_epoch} to {total_epochs}")
+    overall_start = time.time()
 
-    # start training
-    train(train_loader, dist_model, optimizer, lr_scheduler, tb_writer)
+    for epoch in range(start_epoch, total_epochs):
+        if trainer.interrupted:
+            break
+            
+        model.train()
+        epoch_start = time.time()
+        epoch_losses = []
+        
+        logger.info(f"\n{'='*50}\n Epoch [{epoch+1}/{total_epochs}]")
+        
+        for i, data in enumerate(dataloader):
+            if trainer.interrupted:
+                break
+                
+            outputs = model(data)
+            loss = outputs['total_loss']
+            
+            optimizer.zero_grad()
+            loss.backward()
+            
+            if cfg.TRAIN.GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.TRAIN.GRAD_CLIP)
+                
+            optimizer.step()
+            epoch_losses.append(loss.item())
+            
+            if i % cfg.TRAIN.PRINT_FREQ == 0:
+                lr = lr_scheduler.get_cur_lr()
+                now = time.time()
+                elapsed = now - overall_start
+                iter_time = (now - epoch_start) / (i + 1)
+                remaining_iters = (total_epochs - epoch - 1) * len(dataloader) + (len(dataloader) - i - 1)
+                eta = iter_time * remaining_iters
+                
+                logger.info(
+                    f" Elapsed: {str(datetime.timedelta(seconds=int(elapsed)))} | "
+                    f"ETA: {str(datetime.timedelta(seconds=int(eta)))} | "
+                    f"Iter [{i}/{len(dataloader)}] | "
+                    f"Loss: {loss.item():.4f} | LR: {lr:.6f}"
+                )
+                
+        epoch_time = time.time() - epoch_start
+        lr_scheduler.step()
+        
+        # AUTO-SAVE "BEST" MODEL
+        current_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float('inf')
+        if current_epoch_loss < best_loss:
+            best_loss = current_epoch_loss
+            trainer.save_checkpoint(epoch, 'best.pth', is_best=True)
+            logger.info(f" Best model updated! New Loss: {best_loss:.4f}")
+        
+        # Save latest checkpoint
+        trainer.save_checkpoint(epoch, 'latest.pth')
+        
+        # Save milestone checkpoints
+        if (epoch + 1) % 5 == 0 or epoch == total_epochs - 1:
+            trainer.save_checkpoint(epoch, f'epoch_{epoch+1}.pth')
+            
+        torch.cuda.empty_cache()
+        logger.info(f" Epoch {epoch+1} completed in {epoch_time:.2f}s | Avg Loss: {current_epoch_loss:.4f}")
+        
+        if trainer.interrupted:
+            trainer.save_checkpoint(epoch, 'latest.pth')
+            break
 
+    total_time = time.time() - overall_start
+    logger.info(f"\n Training finished! Total duration: {str(datetime.timedelta(seconds=int(total_time)))}")
 
 if __name__ == '__main__':
-    seed_torch(args.seed)
     main()
