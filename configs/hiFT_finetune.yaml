@@ -1,6 +1,18 @@
 META_ARC: "HiFT_alexnet_aic4"
 CUDA: True
-
+# ======================================================================
+# ROOT CAUSE OF SCALE REGRESSION COLLAPSE (from comparison video):
+# The original YAML had OUTPUT_SIZE: 21 while config.py defaulted to 11.
+# After cfg.merge_from_file(), OUTPUT_SIZE became 21 — but the model's
+# AlexNet backbone produces 11x11 feature maps for a 287px input.
+# AnchorTarget.get() was called with size=21 -> generated (1,21,21) labels.
+# decode_loc() built an 11x11 grid -> (B,121,4) predictions.
+# DataLoader batched labels to (B,4,21,21) -> 441 elements, not 121.
+# The mismatch caused silent index wrap-around in IoU loss computation —
+# the model learned to predict maximum tanh outputs (+-1) to minimize
+# whatever garbage signal came through. Result: bbox grows to 40x size.
+# FIX: OUTPUT_SIZE: 11 (the architecturally correct value for SEARCH=287)
+# ======================================================================
 TRAIN:
   THR_HIGH: 0.6
   THR_LOW: 0.3
@@ -8,39 +20,38 @@ TRAIN:
   POS_NUM: 16
   TOTAL_NUM: 64
   CLS_WEIGHT: 1.0
-  LOC_WEIGHT: 3.0
+  LOC_WEIGHT: 1.5
   SHAPE_WEIGHT: 2.0
   EXEMPLAR_SIZE: 127
   SEARCH_SIZE: 287
+  OUTPUT_SIZE: 11
   OUTPUTFEATURE_SIZE: 11
   LABEL_RANGE: 4
   BASE_SIZE: 8
-  OUTPUT_SIZE: 21
   RESUME: ''
   PRETRAINED: 1
   LARGER: 2.0
   LOG_DIR: './logs'
   SNAPSHOT_DIR: './snapshot'
-  EPOCH: 15
+  EPOCH: 20
   START_EPOCH: 0
   BATCH_SIZE: 4
   NUM_GPU: 1
-  NUM_WORKERS: 1
+  NUM_WORKERS: 2
   MOMENTUM: 0.9
   WEIGHT_DECAY: 0.0001
-  BASE_LR: 0.001
+  BASE_LR: 0.00005
   LR:
     TYPE: 'log'
     KWARGS:
-      start_lr: 0.001
-      end_lr: 1e-4
+      start_lr: 0.00005
+      end_lr: 0.000001
   LR_WARMUP:
     WARMUP: True
     TYPE: 'step'
     EPOCH: 3
   PRINT_FREQ: 20
   GRAD_CLIP: 10.0
-  # ✅ FIXED: Proper YAML syntax (multi-line, not semicolons)
   w1: 1.0
   w2: 1.0
   w3: 1.0
@@ -48,15 +59,17 @@ TRAIN:
   w5: 1.0
   range: 2.0
   MASK_WEIGHT: 1
-  LOG_GRADS: False
+  LOG_GRADS: True
   clsandlocchannel: 256
   groupchannel: 32
   PR: 1
 
 DATASET:
-  NAMES: ['AIC4']  # ✅ Use list syntax
+  NAMES: ['AIC4']
   NEG: 0.2
   GRAY: 0.0
+  # VIDEOS_PER_EPOCH must be at DATASET level, NOT under AIC4
+  VIDEOS_PER_EPOCH: 20000
   TEMPLATE:
     SHIFT: 4
     SCALE: 0.05
@@ -64,8 +77,8 @@ DATASET:
     FLIP: 0.0
     COLOR: 1.0
   SEARCH:
-    SHIFT: 64
-    SCALE: 0.18
+    SHIFT: 32
+    SCALE: 0.15
     BLUR: 0.0
     FLIP: 0.0
     COLOR: 1.0
@@ -74,7 +87,7 @@ DATASET:
     ANNO: 'data/processed/train.json'
     FRAME_RANGE: 50
     NUM_USE: 100000
-  VIDEOS_PER_EPOCH: 20000
+    # VIDEOS_PER_EPOCH removed from here — moved to parent DATASET level
 
 BACKBONE:
   TYPE: 'alexnet'
@@ -90,13 +103,13 @@ TRACK:
   TYPE: 'HiFTtracker'
   PENALTY_K: 0.04
   WINDOW_INFLUENCE: 0.44
-  LR: 0.4
+  LR: 0.33
   w1: 1.2
   w2: 1.0
   w3: 1.6
   LARGER: 1.4
   EXEMPLAR_SIZE: 127
-  INSTANCE_SIZE: 255
+  INSTANCE_SIZE: 287
   BASE_SIZE: 8
   STRIDE: 8
   CONTEXT_AMOUNT: 0.5

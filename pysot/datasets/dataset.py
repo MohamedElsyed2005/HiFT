@@ -1,75 +1,64 @@
 # Copyright (c) SenseTime. All Rights Reserved.
 # ============================================================
 # COMPREHENSIVE BUG FIXES — Competition-Grade Dataset Pipeline
-#
 # ROOT CAUSES OF MISSING IMAGES (full audit):
-#
 # BUG 1 — PATH CONSTRUCTION (CRITICAL, PRIMARY CAUSE):
-#   SubDataset.get_image_anno() builds:
-#     os.path.join(self.root, video, '{frame}.{track}.x.jpg')
-#   But self.root = cfg.DATASET.AIC4.ROOT = 'data/processed/crop511'
-#   and video = seq_name (e.g. "Car_video_2").
-#   However preprocess_data.py saves images under:
-#     OUTPUT_IMAGE_ROOT / seq_name / "{frame:06d}.0.x.jpg"
-#   This matches ONLY IF the working directory when training is the project
-#   root. If cwd differs by even one level, ALL paths break silently because
-#   cv2.imread returns None for missing files (no exception).
-#   FIX: Convert root to absolute path at SubDataset construction time using
-#   the project root anchored to this file's location, not cwd.
-#
+# SubDataset.get_image_anno() builds:
+# os.path.join(self.root, video, '{frame}.{track}.x.jpg')
+# But self.root = cfg.DATASET.AIC4.ROOT = 'data/processed/crop511'
+# and video = seq_name (e.g. "Car_video_2").
+# However preprocess_data.py saves images under:
+# OUTPUT_IMAGE_ROOT / seq_name / "{frame:06d}.0.x.jpg"
+# This matches ONLY IF the working directory when training is the project
+# root. If cwd differs by even one level, ALL paths break silently because
+# cv2.imread returns None for missing files (no exception).
+# FIX: Convert root to absolute path at SubDataset construction time using
+# the project root anchored to this file's location, not cwd.
 # BUG 2 — FRAME STRING FORMATTING:
-#   get_image_anno() calls: "{:06d}".format(frame)
-#   But the pick list contains raw integers from frames[], which are parsed
-#   from the JSON keys. The JSON keys in train.json ARE already "{:06d}"
-#   strings (e.g. "000042"). When iterating frames[], we convert to int then
-#   back to string with :06d — this is correct. BUT if any preprocessing
-#   wrote frame keys with a different zero-padding (e.g., "42" instead of
-#   "000042"), the lookup fails. preprocess_data.py uses {:06d} consistently.
-#   FIX: Added explicit validation and normalization in SubDataset._load_meta.
-#
+# get_image_anno() calls: "{:06d}".format(frame)
+# But the pick list contains raw integers from frames[], which are parsed
+# from the JSON keys. The JSON keys in train.json ARE already "{:06d}"
+# strings (e.g. "000042"). When iterating frames[], we convert to int then
+# back to string with :06d — this is correct. BUT if any preprocessing
+# wrote frame keys with a different zero-padding (e.g., "42" instead of
+# "000042"), the lookup fails. preprocess_data.py uses {:06d} consistently.
+# FIX: Added explicit validation and normalization in SubDataset._load_meta.
 # BUG 3 — SILENT imread FAILURE:
-#   cv2.imread() returns None for missing files with NO exception, NO warning.
-#   The old fallback returned zero tensors after 5 failed retries, which:
-#   (a) produces loss=0.0, wasting GPU cycles and distorting the loss curve
-#   (b) makes training appear to work while the dataset is effectively empty
-#   FIX: Strict mode — on first None from imread, immediately resample to a
-#   different random sequence. Zero-tensor fallback is REMOVED. If ALL
-#   retries fail, raise RuntimeError so the DataLoader crash is visible.
-#
+# cv2.imread() returns None for missing files with NO exception, NO warning.
+# The old fallback returned zero tensors after 5 failed retries, which:
+# (a) produces loss=0.0, wasting GPU cycles and distorting the loss curve
+# (b) makes training appear to work while the dataset is effectively empty
+# FIX: Strict mode — on first None from imread, immediately resample to a
+# different random sequence. Zero-tensor fallback is REMOVED. If ALL
+# retries fail, raise RuntimeError so the DataLoader crash is visible.
 # BUG 4 — EPOCH DATASET SIZE MULTIPLICATION (already partially fixed):
-#   Old code: self.num *= cfg.TRAIN.EPOCH
-#   This made one DataLoader "epoch" = EPOCH full data passes, so LR
-#   scheduler fired 15x too slowly. Already fixed in provided code.
-#   Keeping fix and adding assertion to guard against regression.
-#
+# Old code: self.num *= cfg.TRAIN.EPOCH
+# This made one DataLoader "epoch" = EPOCH full data passes, so LR
+# scheduler fired 15x too slowly. Already fixed in provided code.
+# Keeping fix and adding assertion to guard against regression.
 # BUG 5 — PICK LIST OVERFLOW:
-#   __getitem__(index) did: index = self.pick[index % len(self.pick)]
-#   The % guard is correct but the % hides index-out-of-range bugs.
-#   FIX: Use plain index with bounds check and clear error message.
-#
+# getitem(index) did: index = self.pick[index % len(self.pick)]
+# The % guard is correct but the % hides index-out-of-range bugs.
+# FIX: Use plain index with bounds check and clear error message.
 # BUG 6 — MISSING IMAGE VALIDATION AT STARTUP:
-#   The dataset loaded the JSON but never checked whether the referenced
-#   image files actually exist on disk. Training could run for hours before
-#   the first batch revealed missing files.
-#   FIX: Added optional startup validation with clear per-sequence reporting.
-#   Controlled by VALIDATE_ON_INIT env var (set to "1" to enable).
-#
+# The dataset loaded the JSON but never checked whether the referenced
+# image files actually exist on disk. Training could run for hours before
+# the first batch revealed missing files.
+# FIX: Added optional startup validation with clear per-sequence reporting.
+# Controlled by VALIDATE_ON_INIT env var (set to "1" to enable).
 # BUG 7 — WINDOWS PATH SEPARATORS IN JSON:
-#   If train.json was generated on Windows, video/track keys may contain
-#   backslashes. cv2.imread fails silently on Linux with backslash paths.
-#   FIX: Normalize all path components with os.path.normpath + replace('\\', '/').
-#
+# If train.json was generated on Windows, video/track keys may contain
+# backslashes. cv2.imread fails silently on Linux with backslash paths.
+# FIX: Normalize all path components with os.path.normpath + replace('\', '/').
 # BUG 8 — TRACK ID KEY ASSUMPTION:
-#   SubDataset always looks up track "0" (the only track ID written by
-#   preprocess_data.py). But if the JSON has different track IDs, the
-#   lookup fails silently. FIX: Use the actual first track key if "0" is absent.
+# SubDataset always looks up track "0" (the only track ID written by
+# preprocess_data.py). But if the JSON has different track IDs, the
+# lookup fails silently. FIX: Use the actual first track key if "0" is absent.
 # ============================================================
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
-
 import json
 import logging
 import sys
@@ -77,20 +66,15 @@ import os
 import re
 from collections import namedtuple
 from pathlib import Path
-
 Corner = namedtuple('Corner', 'x1 y1 x2 y2')
-
 import cv2
 import numpy as np
 from torch.utils.data import Dataset
-
 from pysot.datasets.anchortarget import AnchorTarget
 from pysot.utils.bbox import center2corner, Center
 from pysot.datasets.augmentation import Augmentation
 from pysot.core.config import cfg
-
 logger = logging.getLogger("global")
-
 pyv = sys.version[0]
 if pyv[0] == '3':
     cv2.ocl.setUseOpenCL(False)
@@ -98,7 +82,6 @@ if pyv[0] == '3':
 # ── Project root: two levels up from this file (pysot/datasets/dataset.py)
 _THIS_DIR = Path(__file__).resolve().parent          # …/pysot/datasets/
 _PROJECT_ROOT = _THIS_DIR.parent.parent              # …/project_root/
-
 
 def _abs_path(path_str: str) -> Path:
     """
@@ -113,11 +96,9 @@ def _abs_path(path_str: str) -> Path:
         return p
     return (_PROJECT_ROOT / p).resolve()
 
-
 def _normalize_key(k: str) -> str:
     """Normalize path separators in JSON keys (guard against Windows paths)."""
     return k.replace('\\', '/')
-
 
 class SubDataset(object):
     def __init__(self, name, root, anno, frame_range, num_use, start_idx):
@@ -150,10 +131,10 @@ class SubDataset(object):
 
         if self.num == 0:
             raise RuntimeError(
-                f"[{name}] No valid sequences found in {anno_path}. "
+                f"[{name}] No valid sequences found in {anno_path}.  "
                 f"Check that preprocess_data.py completed successfully.")
 
-        logger.info(f"[{name}] loaded: {self.num} sequences | "
+        logger.info(f"[{name}] loaded: {self.num} sequences |  "
                     f"num_use={self.num_use}")
         self.path_format = '{}.{}.{}.jpg'
 
@@ -237,11 +218,11 @@ class SubDataset(object):
                 f"  Re-run tools/preprocess_data.py to regenerate.")
             if missing / max(total, 1) > 0.5:
                 raise RuntimeError(
-                    f"[{self.name}] Over 50% of images missing. "
+                    f"[{self.name}] Over 50% of images missing.  "
                     f"Cannot train. Run preprocess_data.py.")
 
     def log(self):
-        logger.info(f"[{self.name}] start_idx={self.start_idx} "
+        logger.info(f"[{self.name}] start_idx={self.start_idx}  "
                     f"use={self.num_use}/{self.num} root={self.root}")
 
     def shuffle(self):
@@ -303,11 +284,9 @@ class SubDataset(object):
     def __len__(self):
         return self.num
 
-
 class TrkDataset(Dataset):
     def __init__(self):
         super(TrkDataset, self).__init__()
-
         self.all_dataset = []
         self.anchor_target = AnchorTarget()
         start = 0
@@ -351,7 +330,7 @@ class TrkDataset(Dataset):
         assert cfg.TRAIN.EPOCH > 0, "EPOCH must be positive"
 
         self.pick = self.shuffle()
-        logger.info(f"TrkDataset ready: {self.num} samples/epoch "
+        logger.info(f"TrkDataset ready: {self.num} samples/epoch  "
                     f"across {len(self.all_dataset)} sub-dataset(s)")
 
     def shuffle(self):
@@ -410,7 +389,7 @@ class TrkDataset(Dataset):
             local_index = local_index % dataset.num  # safety
 
             gray = cfg.DATASET.GRAY and cfg.DATASET.GRAY > np.random.random()
-            neg  = cfg.DATASET.NEG  and cfg.DATASET.NEG  > np.random.random()
+            neg  = cfg.DATASET.NEG and cfg.DATASET.NEG > np.random.random()
 
             try:
                 if neg:
@@ -430,20 +409,20 @@ class TrkDataset(Dataset):
                 # FIX 3: Hard check — no silent zeros
                 if template_image is None:
                     logger.warning(
-                        f"imread returned None (attempt {attempt+1}): "
+                        f"imread returned None (attempt {attempt+1}):  "
                         f"{template_path}")
                     index = np.random.randint(0, self.num)
                     continue
 
                 if search_image is None:
                     logger.warning(
-                        f"imread returned None (attempt {attempt+1}): "
+                        f"imread returned None (attempt {attempt+1}):  "
                         f"{search_path}")
                     index = np.random.randint(0, self.num)
                     continue
 
                 template_box = self._get_bbox(template_image, template_anno)
-                search_box   = self._get_bbox(search_image,   search_anno)
+                search_box   = self._get_bbox(search_image, search_anno)
 
                 template_img, _ = self.template_aug(
                     template_image, template_box,
@@ -475,14 +454,13 @@ class TrkDataset(Dataset):
 
             except Exception as e:
                 logger.warning(
-                    f"__getitem__ attempt {attempt+1}/{MAX_RETRIES} "
+                    f"__getitem__ attempt {attempt+1}/{MAX_RETRIES}  "
                     f"failed at index {index}: {e}")
                 index = np.random.randint(0, self.num)
                 continue
 
         # ── All retries exhausted — this is a data pipeline failure ──
         raise RuntimeError(
-            f"TrkDataset.__getitem__: {MAX_RETRIES} consecutive failures. "
+            f"TrkDataset.__getitem__: {MAX_RETRIES} consecutive failures.  "
             f"Run tools/validate_dataset.py to diagnose missing images.\n"
-            f"Last index tried: {index}"
-        )
+            f"Last index tried: {index}")
