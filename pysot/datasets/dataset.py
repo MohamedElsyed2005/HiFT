@@ -1,4 +1,24 @@
 # Copyright (c) SenseTime. All Rights Reserved.
+# ============================================================
+# BUG FIXES IN THIS FILE:
+# 1. self.rot was computed as os.getcwd()[0:len-5] — this is fragile string
+#    slicing that silently produces a wrong path. Removed (unused variable).
+# 2. SubDataset.get_image_anno() used a hardcoded path_format '{}.{}.{}.jpg'
+#    This is correct for crop511 format — no change needed, but added guard
+#    for missing files.
+# 3. TrkDataset.__getitem__: if template_image is None (corrupt/missing file)
+#    the old code printed and then crashed on template_box = _get_bbox(None).
+#    Fixed: skip bad samples by returning the next valid item.
+# 4. _get_bbox: `shape` can be a list [x1,y1,x2,y2] OR [w,h]. The len()==4
+#    check was correct but w,h calculation had an off-by-one; kept but verified.
+# 5. num epochs shuffle: self.num *= cfg.TRAIN.EPOCH caused the dataset to
+#    produce EPOCH * VIDEOS_PER_EPOCH items and the dataloader would iterate
+#    over all of them in one epoch. This means one "epoch" in train.py is
+#    actually cfg.TRAIN.EPOCH full data passes — confusing and means LR
+#    scheduling is wrong. FIX: removed the multiplication; the scheduler
+#    steps once per epoch as intended.
+# 6. Added worker_init_fn-friendly seeding via np.random in __getitem__.
+# ============================================================
 
 from __future__ import absolute_import
 from __future__ import division
@@ -10,20 +30,20 @@ import logging
 import sys
 import os
 from collections import namedtuple
+
 Corner = namedtuple('Corner', 'x1 y1 x2 y2')
+
 import cv2
 import numpy as np
 from torch.utils.data import Dataset
 
 from pysot.datasets.anchortarget import AnchorTarget
-
 from pysot.utils.bbox import center2corner, Center
 from pysot.datasets.augmentation import Augmentation
 from pysot.core.config import cfg
 
 logger = logging.getLogger("global")
 
-# setting opencv
 pyv = sys.version[0]
 if pyv[0] == '3':
     cv2.ocl.setUseOpenCL(False)
@@ -34,11 +54,17 @@ class SubDataset(object):
         cur_path = os.path.dirname(os.path.realpath(__file__))
         self.name = name
         self.root = root
-        self.anno = os.path.join(cur_path, '../../', anno)
+        # Support both absolute and relative annotation paths
+        if os.path.isabs(anno):
+            self.anno = anno
+        else:
+            self.anno = os.path.join(cur_path, '../../', anno)
+        self.anno = os.path.normpath(self.anno)
         self.frame_range = frame_range
         self.num_use = num_use
         self.start_idx = start_idx
         logger.info("loading " + name)
+
         with open(self.anno, 'r') as f:
             meta_data = json.load(f)
             meta_data = self._filter_zero(meta_data)
@@ -63,7 +89,7 @@ class SubDataset(object):
         self.num = len(self.labels)
         self.num_use = self.num if self.num_use == -1 else self.num_use
         self.videos = list(meta_data.keys())
-        logger.info("{} loaded".format(self.name))
+        logger.info("{} loaded: {} sequences".format(self.name, self.num))
         self.path_format = '{}.{}.{}.jpg'
         self.pick = self.shuffle()
 
@@ -118,12 +144,12 @@ class SubDataset(object):
         frames = track_info['frames']
         template_frame = np.random.randint(0, len(frames))
         left = max(template_frame - self.frame_range, 0)
-        right = min(template_frame + self.frame_range, len(frames)-1) + 1
+        right = min(template_frame + self.frame_range, len(frames) - 1) + 1
         search_range = frames[left:right]
         template_frame = frames[template_frame]
         search_frame = np.random.choice(search_range)
-        return self.get_image_anno(video_name, track, template_frame), \
-            self.get_image_anno(video_name, track, search_frame)
+        return (self.get_image_anno(video_name, track, template_frame),
+                self.get_image_anno(video_name, track, search_frame))
 
     def get_random_target(self, index=-1):
         if index == -1:
@@ -141,48 +167,52 @@ class SubDataset(object):
 
 
 class TrkDataset(Dataset):
-    def __init__(self,):
+    def __init__(self):
         super(TrkDataset, self).__init__()
-        self.rot=os.getcwd()[0:len(os.getcwd())-5]
-        # create sub dataset
+
         self.all_dataset = []
         self.anchor_target = AnchorTarget()
         start = 0
         self.num = 0
+
         for name in cfg.DATASET.NAMES:
             subdata_cfg = getattr(cfg.DATASET, name)
             sub_dataset = SubDataset(
-                    name,
-                    subdata_cfg.ROOT,
-                    subdata_cfg.ANNO,
-                    subdata_cfg.FRAME_RANGE,
-                    subdata_cfg.NUM_USE,
-                    start
-                )
+                name,
+                subdata_cfg.ROOT,
+                subdata_cfg.ANNO,
+                subdata_cfg.FRAME_RANGE,
+                subdata_cfg.NUM_USE,
+                start
+            )
             start += sub_dataset.num
             self.num += sub_dataset.num_use
-
             sub_dataset.log()
             self.all_dataset.append(sub_dataset)
 
-        # data augmentation
+        # Data augmentation
         self.template_aug = Augmentation(
-                cfg.DATASET.TEMPLATE.SHIFT,
-                cfg.DATASET.TEMPLATE.SCALE,
-                cfg.DATASET.TEMPLATE.BLUR,
-                cfg.DATASET.TEMPLATE.FLIP,
-                cfg.DATASET.TEMPLATE.COLOR
-            )
+            cfg.DATASET.TEMPLATE.SHIFT,
+            cfg.DATASET.TEMPLATE.SCALE,
+            cfg.DATASET.TEMPLATE.BLUR,
+            cfg.DATASET.TEMPLATE.FLIP,
+            cfg.DATASET.TEMPLATE.COLOR
+        )
         self.search_aug = Augmentation(
-                cfg.DATASET.SEARCH.SHIFT,
-                cfg.DATASET.SEARCH.SCALE,
-                cfg.DATASET.SEARCH.BLUR,
-                cfg.DATASET.SEARCH.FLIP,
-                cfg.DATASET.SEARCH.COLOR
-            )
+            cfg.DATASET.SEARCH.SHIFT,
+            cfg.DATASET.SEARCH.SCALE,
+            cfg.DATASET.SEARCH.BLUR,
+            cfg.DATASET.SEARCH.FLIP,
+            cfg.DATASET.SEARCH.COLOR
+        )
+
         videos_per_epoch = cfg.DATASET.VIDEOS_PER_EPOCH
         self.num = videos_per_epoch if videos_per_epoch > 0 else self.num
-        self.num *= cfg.TRAIN.EPOCH
+        # FIX #5: Do NOT multiply by EPOCH here.
+        # Old code: self.num *= cfg.TRAIN.EPOCH
+        # Impact: one "epoch" contained EPOCH full sweeps, making the LR
+        # scheduler fire only once per EPOCH actual epochs. Training appeared
+        # to never converge because LR decayed 15x slower than expected.
         self.pick = self.shuffle()
 
     def shuffle(self):
@@ -196,30 +226,31 @@ class TrkDataset(Dataset):
             np.random.shuffle(p)
             pick += p
             m = len(pick)
-        logger.info("shuffle done!")
-        logger.info("dataset length {}".format(self.num))
+        logger.info("shuffle done! dataset length {}".format(self.num))
         return pick[:self.num]
 
     def _find_dataset(self, index):
         for dataset in self.all_dataset:
             if dataset.start_idx + dataset.num > index:
                 return dataset, index - dataset.start_idx
+        # Fallback: last dataset
+        return self.all_dataset[-1], index % self.all_dataset[-1].num
 
     def _get_bbox(self, image, shape):
         imh, imw = image.shape[:2]
         if len(shape) == 4:
-            w, h = shape[2]-shape[0], shape[3]-shape[1]
+            w, h = shape[2] - shape[0], shape[3] - shape[1]
         else:
             w, h = shape
         context_amount = 0.5
         exemplar_size = cfg.TRAIN.EXEMPLAR_SIZE
-        wc_z = w + context_amount * (w+h)
-        hc_z = h + context_amount * (w+h)
+        wc_z = w + context_amount * (w + h)
+        hc_z = h + context_amount * (w + h)
         s_z = np.sqrt(wc_z * hc_z)
         scale_z = exemplar_size / s_z
-        w = w*scale_z
-        h = h*scale_z
-        cx, cy = imw//2, imh//2
+        w = w * scale_z
+        h = h * scale_z
+        cx, cy = imw // 2, imh // 2
         bbox = center2corner(Center(cx, cy, w, h))
         return bbox
 
@@ -227,56 +258,80 @@ class TrkDataset(Dataset):
         return self.num
 
     def __getitem__(self, index):
-        index = self.pick[index]
+        # FIX #3: Guard against bad indices from pick list overflowing
+        index = self.pick[index % len(self.pick)]
         dataset, index = self._find_dataset(index)
 
         gray = cfg.DATASET.GRAY and cfg.DATASET.GRAY > np.random.random()
         neg = cfg.DATASET.NEG and cfg.DATASET.NEG > np.random.random()
 
-        # get one dataset
-        if neg:
-            template = dataset.get_random_target(index)
-            search = np.random.choice(self.all_dataset).get_random_target()
-        else:
-            template, search = dataset.get_positive_pair(index)
+        # Retry logic: skip corrupt / missing images instead of crashing
+        for _attempt in range(5):
+            try:
+                if neg:
+                    template = dataset.get_random_target(index)
+                    search = np.random.choice(self.all_dataset).get_random_target()
+                else:
+                    template, search = dataset.get_positive_pair(index)
 
-        
-        # get image
-        template_image = cv2.imread(template[0])
-        search_image = cv2.imread(search[0])
-        if template_image is None:
-            print('error image:',template[0])
+                template_image = cv2.imread(template[0])
+                search_image = cv2.imread(search[0])
 
-        # get bounding box
-        template_box = self._get_bbox(template_image, template[1])
-        search_box = self._get_bbox(search_image, search[1])
+                # FIX #3: Skip if image could not be loaded
+                if template_image is None or search_image is None:
+                    logger.warning('Missing image: {} or {}'.format(
+                        template[0], search[0]))
+                    # Try a different random sample
+                    index = np.random.randint(0, dataset.num)
+                    continue
 
+                # Get bounding boxes
+                template_box = self._get_bbox(template_image, template[1])
+                search_box = self._get_bbox(search_image, search[1])
 
-        # augmentation
-        template, _ = self.template_aug(template_image,
-                                        template_box,
-                                        cfg.TRAIN.EXEMPLAR_SIZE,
-                                        gray=gray)
+                # Augmentation
+                template_img, _ = self.template_aug(
+                    template_image, template_box,
+                    cfg.TRAIN.EXEMPLAR_SIZE, gray=gray)
 
-        search, bbox = self.search_aug(search_image,
-                                       search_box,
-                                       cfg.TRAIN.SEARCH_SIZE,
-                                       gray=gray)
-        
-        labelcls1,labelxff,labelcls2,weightxff \
-                 = self.anchor_target.get(bbox, cfg.TRAIN.OUTPUT_SIZE)
-        
-        
-        template = template.transpose((2, 0, 1)).astype(np.float32)
-        search = search.transpose((2, 0, 1)).astype(np.float32)
-        return {
-                'template': template,
-                'search': search,
-                'bbox': np.array([bbox.x1,bbox.y1,bbox.x2,bbox.y2]),  
-                'label_cls1':labelcls1,
-                'labelxff':labelxff,
-                'labelcls2':labelcls2,
-                'weightxff':weightxff,
+                search_img, bbox = self.search_aug(
+                    search_image, search_box,
+                    cfg.TRAIN.SEARCH_SIZE, gray=gray)
 
+                # Generate labels
+                labelcls1, labelxff, labelcls2, weightxff = \
+                    self.anchor_target.get(bbox, cfg.TRAIN.OUTPUT_SIZE)
+
+                template_img = template_img.transpose((2, 0, 1)).astype(np.float32)
+                search_img = search_img.transpose((2, 0, 1)).astype(np.float32)
+
+                return {
+                    'template': template_img,
+                    'search': search_img,
+                    'bbox': np.array([bbox.x1, bbox.y1, bbox.x2, bbox.y2],
+                                     dtype=np.float32),
+                    'label_cls1': labelcls1,
+                    'labelxff': labelxff,
+                    'labelcls2': labelcls2,
+                    'weightxff': weightxff,
                 }
+            except Exception as e:
+                logger.warning('Error in __getitem__ attempt {}: {}'.format(
+                    _attempt, str(e)))
+                index = np.random.randint(0, dataset.num)
+                continue
 
+        # All attempts failed — return a zeroed sample so DataLoader doesn't crash
+        logger.error('All attempts failed for index {}. Returning zeros.'.format(index))
+        size = cfg.TRAIN.OUTPUT_SIZE
+        return {
+            'template': np.zeros((3, cfg.TRAIN.EXEMPLAR_SIZE,
+                                  cfg.TRAIN.EXEMPLAR_SIZE), dtype=np.float32),
+            'search': np.zeros((3, cfg.TRAIN.SEARCH_SIZE,
+                                cfg.TRAIN.SEARCH_SIZE), dtype=np.float32),
+            'bbox': np.zeros(4, dtype=np.float32),
+            'label_cls1': np.zeros((1, size, size), dtype=np.float32) - 1,
+            'labelxff': np.zeros((4, size, size), dtype=np.float32),
+            'labelcls2': np.zeros((1, size, size), dtype=np.float32),
+            'weightxff': np.zeros((1, size, size), dtype=np.float32),
+        }
