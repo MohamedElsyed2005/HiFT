@@ -81,11 +81,16 @@ __C.TRAIN.NUM_WORKERS = 2   # slightly higher than 1 for better throughput
 
 __C.TRAIN.MOMENTUM = 0.9
 __C.TRAIN.WEIGHT_DECAY = 0.0001
-__C.TRAIN.BASE_LR = 0.001
+
+__C.TRAIN.BASE_LR = 0.0005
 
 __C.TRAIN.LR = CN()
-__C.TRAIN.LR.TYPE = 'log'
+__C.TRAIN.LR.TYPE = 'step'
 __C.TRAIN.LR.KWARGS = CN(new_allowed=True)
+__C.TRAIN.LR.KWARGS.start_lr = 0.0005
+__C.TRAIN.LR.KWARGS.end_lr = 0.00005
+__C.TRAIN.LR.KWARGS.step = 5
+__C.TRAIN.LR.KWARGS.mult = 0.1
 
 __C.TRAIN.LR_WARMUP = CN()
 __C.TRAIN.LR_WARMUP.WARMUP = True
@@ -131,7 +136,8 @@ __C.DATASET.AIC4 = CN()
 __C.DATASET.AIC4.ROOT = 'data/processed/crop511'
 __C.DATASET.AIC4.ANNO = 'data/processed/train.json'
 __C.DATASET.AIC4.FRAME_RANGE = 50
-__C.DATASET.AIC4.NUM_USE = 100000
+
+__C.DATASET.AIC4.NUM_USE = 60000
 
 __C.DATASET.VIDEOS_PER_EPOCH = 20000
 
@@ -160,7 +166,8 @@ __C.BACKBONE.PRETRAINED = 'pretrained/first.pth'
 
 # Only fine-tune last two layers — freeze early layers to save memory
 __C.BACKBONE.TRAIN_LAYERS = ['layer4', 'layer5']
-__C.BACKBONE.LAYERS_LR = 0.1
+__C.BACKBONE.LAYERS_LR = 0.05
+
 __C.BACKBONE.TRAIN_EPOCH = 10
 
 # ------------------------------------------------------------------------ #

@@ -1,67 +1,81 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Generate submission.csv for AIC-4 Kaggle leaderboard.
+tools/submit.py
+===============
+Generate submission.csv for the AIC-4 UAV Tracking Kaggle leaderboard.
+
+Submission format (verified against sample_submission.csv):
+  id,x,y,w,h
+  dataset1/Car_video_0,x,y,w,h     ← frame 0 of sequence Car_video
+  dataset1/Car_video_1,x,y,w,h     ← frame 1
+  ...
+
+ID format: {dataset}/{seq_name}_{frame_index}   (0-based frame index)
 
 ============================================================
 BUG FIXES:
-1. CRITICAL: Submission format is id,x,y,w,h where
-   id = "dataset/seq_name_frameIndex" (e.g. "dataset1/Car_video_0").
-   Old code wrote per-sequence rows, not per-frame rows.
-   Fixed: write one row per frame matching the sample_submission.csv format.
+1. CRITICAL: id format verified against sample_submission.csv.
+   Format is: dataset/seq_name_frameIdx (e.g. "dataset1/Car_video_0")
+   NOT "dataset1/Car_video/0" or "Car_video_0"
 
-2. CRITICAL: The sample_submission.csv uses 0-based frame indices appended
-   to seq_name with underscore: "dataset1/Car_video_0", "dataset1/Car_video_1"
-   etc. Old code used seq_key (e.g. "dataset1/Car_video") as the id.
+2. CRITICAL: SEARCH_SIZE at inference must be cfg.TRAIN.SEARCH_SIZE (287)
+   not cfg.TRACK.INSTANCE_SIZE (255). Using 255 gives a 9×9 feature map,
+   but the hanning window and score_size are built for 11×11 (287 input).
+   This mismatch causes random bbox predictions. Fixed in hift_tracker.py.
 
-3. INSTANCE_SIZE at inference must be cfg.TRAIN.SEARCH_SIZE (287) to match
-   training feature map size (11×11). Was using cfg.TRACK.INSTANCE_SIZE=255
-   which gives a 9×9 output — wrong size for the hanning window (11).
+3. Annotation parsing uses universal newline mode to handle Windows \\r\\n.
 
-4. Old code broke on annotation files with inconsistent line endings (\\r\\n
-   on Windows-created files). Fixed with universal newline mode.
+4. Frame count is taken from the manifest (n_frames field) — do NOT count
+   annotation lines, as some frames may have absent-target annotations.
 
-5. Added graceful error handling: if tracking fails for a frame, propagate
-   the last valid bbox to avoid empty rows.
+5. If tracking fails mid-sequence, the last valid bbox is propagated forward
+   (better than zeros which would score IoU=0 for those frames).
 
-6. Added AUC/Precision evaluation on public_lb for immediate feedback.
+6. Added --dry-run mode: checks all paths without running the tracker.
+
+7. All paths are absolute, resolved from this file's location.
 ============================================================
 """
 import os
 import sys
 import json
+import argparse
 import cv2
 import torch
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from tqdm import tqdm
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+_THIS_DIR  = Path(__file__).resolve().parent
+_PROJ_ROOT = _THIS_DIR.parent
+sys.path.insert(0, str(_PROJ_ROOT))
 
 from pysot.core.config import cfg
 from pysot.models.model_builder import ModelBuilder
 from pysot.tracker.hift_tracker import HiFTTracker
 
 
-# ---------------------------------------------------------------------------
-# Paths  — adjust if your contest data lives elsewhere
-# ---------------------------------------------------------------------------
-MANIFEST_PATH = os.path.join(
-    PROJECT_ROOT, 'data', 'contest_release', 'metadata',
-    'contestant_manifest.json')
-BASE_DIR = os.path.join(PROJECT_ROOT, 'data', 'contest_release')
-OUTPUT_CSV = os.path.join(PROJECT_ROOT, 'submission.csv')
+# ── Paths ──────────────────────────────────────────────────────────────────
+MANIFEST_PATH = Path(os.environ.get(
+    'CONTEST_DATA_DIR',
+    str(_PROJ_ROOT.parent / 'aic4-uav-tracker' / 'data' / 'contest_release')
+)).resolve() / 'metadata' / 'contestant_manifest.json'
+
+BASE_DIR   = MANIFEST_PATH.parent.parent
+OUTPUT_CSV = _PROJ_ROOT / 'submission.csv'
 
 
-def load_model(model_path):
-    """Load fine-tuned model from checkpoint."""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
-    print(f"Loading model: {model_path}")
+# ── Model loading ──────────────────────────────────────────────────────────
+
+def load_model(model_path: str) -> ModelBuilder:
+    path = Path(model_path)
+    if not path.exists():
+        raise FileNotFoundError(f'Model checkpoint not found: {path}')
+    print(f'Loading model: {path}')
     model = ModelBuilder()
-    checkpoint = torch.load(model_path, map_location='cpu')
+    checkpoint = torch.load(str(path), map_location='cpu')
     state = checkpoint.get('state_dict', checkpoint)
     state = {k.replace('module.', ''): v for k, v in state.items()}
     model.load_state_dict(state, strict=False)
@@ -69,12 +83,14 @@ def load_model(model_path):
     return model
 
 
-def parse_init_bbox(anno_path):
+# ── Annotation parsing ─────────────────────────────────────────────────────
+
+def parse_init_bbox(anno_path: Path) -> list:
     """
-    Read the FIRST valid line of annotation.txt → [x, y, w, h].
-    Format: x,y,w,h (comma or space separated, values may be floats).
+    Read the FIRST line of annotation.txt with a valid [x, y, w, h] bbox.
+    Returns [x, y, w, h] (top-left corner + size, 0-based).
     """
-    with open(anno_path, 'r', newline='') as f:   # FIX #4: universal newlines
+    with open(str(anno_path), 'r', newline='') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -87,44 +103,45 @@ def parse_init_bbox(anno_path):
                         return [x, y, w, h]
                 except ValueError:
                     continue
-    raise ValueError(f"No valid bbox in {anno_path}")
+    raise ValueError(f'No valid bbox found in {anno_path}')
 
 
-def track_sequence(model, video_path, init_bbox, n_frames):
+# ── Tracking ───────────────────────────────────────────────────────────────
+
+def track_sequence(model: ModelBuilder, video_path: Path,
+                   init_bbox: list, n_frames: int) -> list:
     """
-    Track a full sequence.
+    Track a full sequence starting from init_bbox on frame 0.
 
-    Returns: list of (x, y, w, h) per frame (length == n_frames).
-    Frame 0 is the init bbox itself.
+    Returns a list of (x, y, w, h) tuples, length == n_frames.
+    Frame 0 always returns init_bbox.
+    Lost frames propagate the last valid prediction.
     """
     tracker = HiFTTracker(model)
-    results = []
+    results  = []
 
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
+        raise IOError(f'Cannot open video: {video_path}')
 
     ret, frame = cap.read()
     if not ret:
-        raise IOError(f"Cannot read first frame: {video_path}")
+        raise IOError(f'Cannot read frame 0: {video_path}')
 
-    # Initialize on frame 0
     tracker.init(frame, init_bbox)
     x, y, w, h = init_bbox
-    results.append((x, y, w, h))
-
-    last_bbox = (x, y, w, h)
+    results.append((float(x), float(y), float(w), float(h)))
+    last_bbox = results[0]
 
     for _ in range(1, n_frames):
         ret, frame = cap.read()
         if not ret:
-            # Propagate last bbox if video is shorter than manifest says
             results.append(last_bbox)
             continue
         try:
             out = tracker.track(frame)
             bx, by, bw, bh = out['bbox']
-            last_bbox = (bx, by, bw, bh)
+            last_bbox = (float(bx), float(by), float(bw), float(bh))
             results.append(last_bbox)
         except Exception as e:
             results.append(last_bbox)
@@ -133,70 +150,146 @@ def track_sequence(model, video_path, init_bbox, n_frames):
     return results
 
 
-def run():
-    cfg.merge_from_file(os.path.join(PROJECT_ROOT, 'configs',
-                                     'hiFT_finetune.yaml'))
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-    # Load best model (fallback to latest)
-    for candidate in ['snapshot/best.pth', 'snapshot/latest.pth']:
-        path = os.path.join(PROJECT_ROOT, candidate)
-        if os.path.exists(path):
-            model = load_model(path)
-            print(f"Using: {candidate}")
-            break
+def run(args):
+    cfg.merge_from_file(
+        str(_PROJ_ROOT / 'configs' / 'hiFT_finetune.yaml'))
+
+    # ── Load model ────────────────────────────────────────────────────────
+    if args.model:
+        candidates = [args.model]
     else:
-        raise FileNotFoundError("No model checkpoint found in snapshot/")
+        candidates = [
+            str(_PROJ_ROOT / 'snapshot' / 'best.pth'),
+            str(_PROJ_ROOT / 'snapshot' / 'latest.pth'),
+        ]
 
-    with open(MANIFEST_PATH, 'r') as f:
+    model = None
+    if not args.dry_run:
+        for c in candidates:
+            if Path(c).exists():
+                model = load_model(c)
+                print(f'Using checkpoint: {c}')
+                break
+        if model is None:
+            print('ERROR: No model checkpoint found.')
+            print('Train first: python tools/train.py')
+            sys.exit(1)
+
+    # ── Load manifest ─────────────────────────────────────────────────────
+    if not MANIFEST_PATH.exists():
+        print(f'ERROR: manifest not found: {MANIFEST_PATH}')
+        print('Set CONTEST_DATA_DIR env variable.')
+        sys.exit(1)
+
+    with open(str(MANIFEST_PATH), 'r') as f:
         manifest = json.load(f)
 
     public_lb = manifest.get('public_lb', {})
-    print(f"Tracking {len(public_lb)} sequences...")
+    print(f'Tracking {len(public_lb)} sequences...\n')
 
     rows = []
 
-    for seq_key, seq_info in tqdm(public_lb.items(), desc="Generating submission"):
+    for seq_key, seq_info in tqdm(public_lb.items(),
+                                  desc='Generating submission'):
         seq_name   = seq_info['seq_name']
         dataset    = seq_info['dataset']
         n_frames   = seq_info['n_frames']
-        video_path = os.path.join(BASE_DIR, seq_info['video_path'])
-        anno_path  = os.path.join(BASE_DIR, seq_info['annotation_path'])
+        video_path = BASE_DIR / seq_info['video_path']
+        anno_path  = BASE_DIR / seq_info['annotation_path']
 
+        # ── Dry-run mode: just check paths ────────────────────────────────
+        if args.dry_run:
+            video_ok = video_path.exists()
+            anno_ok  = anno_path.exists()
+            status   = '✅' if (video_ok and anno_ok) else '❌'
+            tqdm.write(f'{status}  {seq_key:<50} '
+                       f'video={video_ok} anno={anno_ok}')
+            continue
+
+        # ── Parse init bbox ───────────────────────────────────────────────
         try:
             init_bbox = parse_init_bbox(anno_path)
         except Exception as e:
-            print(f"  WARN: cannot parse init bbox for {seq_key}: {e}")
-            # Zero-fill
+            tqdm.write(f'WARN: cannot parse init bbox for {seq_key}: {e}')
             for i in range(n_frames):
-                rows.append({'id': f"{dataset}/{seq_name}_{i}",
-                             'x': 0, 'y': 0, 'w': 0, 'h': 0})
+                rows.append({
+                    'id': f'{dataset}/{seq_name}_{i}',
+                    'x': 0, 'y': 0, 'w': 0, 'h': 0})
             continue
 
+        # ── Track ─────────────────────────────────────────────────────────
         try:
             bboxes = track_sequence(model, video_path, init_bbox, n_frames)
         except Exception as e:
-            print(f"  ERROR tracking {seq_key}: {e}")
+            tqdm.write(f'ERROR tracking {seq_key}: {e}')
+            x, y, w, h = init_bbox
             for i in range(n_frames):
-                x, y, w, h = init_bbox if i == 0 else (0, 0, 0, 0)
-                rows.append({'id': f"{dataset}/{seq_name}_{i}",
-                             'x': x, 'y': y, 'w': w, 'h': h})
+                rows.append({
+                    'id': f'{dataset}/{seq_name}_{i}',
+                    'x': round(x, 4), 'y': round(y, 4),
+                    'w': round(w, 4), 'h': round(h, 4)})
             continue
 
-        # FIX #1 & #2: one row per frame, id = "dataset/seq_name_frameIdx"
+        # ── Write rows ────────────────────────────────────────────────────
+        # ID format: dataset/seq_name_frameIndex  (verified vs sample_submission.csv)
         for frame_idx, (bx, by, bw, bh) in enumerate(bboxes):
             rows.append({
-                'id': f"{dataset}/{seq_name}_{frame_idx}",
-                'x':  round(float(bx), 4),
-                'y':  round(float(by), 4),
-                'w':  round(float(bw), 4),
-                'h':  round(float(bh), 4),
+                'id': f'{dataset}/{seq_name}_{frame_idx}',
+                'x':  round(bx, 4),
+                'y':  round(by, 4),
+                'w':  round(bw, 4),
+                'h':  round(bh, 4),
             })
 
+    if args.dry_run:
+        print('\nDry run complete. No submission written.')
+        return
+
+    # ── Write CSV ─────────────────────────────────────────────────────────
     df = pd.DataFrame(rows, columns=['id', 'x', 'y', 'w', 'h'])
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nsubmission.csv written: {OUTPUT_CSV}")
-    print(f"Total rows: {len(df)}")
+    df.to_csv(str(OUTPUT_CSV), index=False)
+
+    print(f'\nsubmission.csv written: {OUTPUT_CSV}')
+    print(f'Total rows: {len(df):,}  (expected: 74,293)')
+
+    # ── Sanity check against sample_submission.csv ───────────────────────
+    sample_path = _PROJ_ROOT / 'sample_submission.csv'
+    if sample_path.exists():
+        sample_ids = set(
+            pd.read_csv(str(sample_path))['id'].tolist())
+        our_ids = set(df['id'].tolist())
+        missing = sample_ids - our_ids
+        extra   = our_ids - sample_ids
+        if missing or extra:
+            print(f'\n⚠️  ID MISMATCH vs sample_submission.csv!')
+            print(f'   Missing: {len(missing)}  Extra: {len(extra)}')
+            if missing:
+                print(f'   Sample missing: {list(missing)[:5]}')
+        else:
+            print('\n✅ ID set matches sample_submission.csv exactly.')
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate AIC-4 submission.csv')
+    parser.add_argument('--cfg',
+                        default=str(_PROJ_ROOT / 'configs' /
+                                    'hiFT_finetune.yaml'))
+    parser.add_argument('--model', default=None,
+                        help='Path to model checkpoint (default: auto-detect)')
+    parser.add_argument('--output', default=str(OUTPUT_CSV),
+                        help='Output CSV path')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Check paths only, do not run tracker')
+    args = parser.parse_args()
+
+    global OUTPUT_CSV
+    OUTPUT_CSV = Path(args.output)
+
+    run(args)
 
 
 if __name__ == '__main__':
-    run()
+    main()

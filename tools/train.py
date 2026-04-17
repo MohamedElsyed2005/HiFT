@@ -262,7 +262,7 @@ def main():
     best_loss = float('inf')
     overall_start = time.time()
 
-    logger.info(f"Starting training: epoch {start_epoch} → {total_epochs}")
+    logger.info(f"Starting training: epoch {start_epoch} -> {total_epochs}")
 
     for epoch in range(start_epoch, total_epochs):
         if trainer.interrupted:
