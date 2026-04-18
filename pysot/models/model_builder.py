@@ -102,7 +102,11 @@ class ModelBuilder(nn.Module):
 
         return torch.stack([x1, y1, x2, y2], dim=2)   # (B,H*W,4)
 
-    def forward(self, data):
+    def forward(self, data, loc_weight=None, cls_weight=None):
+        
+        loc_weight = loc_weight if loc_weight is not None else cfg.TRAIN.LOC_WEIGHT
+        cls_weight = cls_weight if cls_weight is not None else cfg.TRAIN.CLS_WEIGHT
+
         template   = data['template'].cuda()
         search     = data['search'].cuda()
         label_cls1 = data['label_cls1'].cuda()
@@ -127,7 +131,7 @@ class ModelBuilder(nn.Module):
         loc_loss    = cfg.TRAIN.w3 * self.iou_loss(
             pred_bbox, target_bbox, weight_flat)
 
-        total_loss = cfg.TRAIN.LOC_WEIGHT * loc_loss + cfg.TRAIN.CLS_WEIGHT * cls_loss
+        total_loss = loc_weight * loc_loss + cls_weight * cls_loss
 
         return {
             'total_loss': total_loss,
