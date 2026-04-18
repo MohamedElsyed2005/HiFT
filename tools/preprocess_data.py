@@ -1,27 +1,40 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-tools/preprocess_data.py
-========================
-Preprocess AIC4 UAV dataset to PySOT crop511 format WITH INTEGRATED TRAIN/VAL SPLIT.
+tools/preprocess_data.py  (FIXED)
+==================================
+CRITICAL BUG FIXED:
+  The original script computed 'output_annos' (the dict of crop-space bounding
+  boxes keyed by seq/track/frame) but NEVER wrote it to disk as train.json /
+  val.json.  Instead it wrote the raw manifest metadata slices to
+  manifest_train.json / manifest_val.json — a completely different format that
+  dataset.py cannot read.
 
-WHAT THIS SCRIPT DOES:
-1. Reads every training video + annotation from the contest release.
-2. Context-crops frames around the target, resizes to SAVE_SIZE×SAVE_SIZE, saves as JPEG.
-3. Builds a dataset index (manifest) keyed EXACTLY as dataset.py expects.
-4. Deterministically splits manifest["train"] into 80% train / 20% val at SEQUENCE level.
-5. Outputs 3 manifests:
-   • manifest_full.json   (crops + public_lb metadata)
-   • manifest_train.json  (80% for training)
-   • manifest_val.json    (20% for validation)
+  dataset.py expects ANNO to be a JSON file of the form:
+      {
+        "dataset1/Car_video_2": {
+          "0": {
+            "000001": [x1, y1, x2, y2],
+            ...
+          }
+        },
+        ...
+      }
 
-CRITICAL DESIGN CHOICES:
-- Directory structure matches `dataset.py` expectations exactly:
-  crop511/dataset1/Car_video_2/000001.0.x.jpg
-- JSON keys match the manifest's sequence identifiers (e.g. "dataset1/Car_video_2").
-- Uses sequential cap.read() (NO cap.set()) to guarantee frame accuracy on H.264.
-- Atomic writes prevent corrupt manifests on interruption.
-- Stratified split preserves dataset distribution balance.
+  This script now writes exactly that structure to:
+      data/processed/train.json    (80% split — used by cfg.DATASET.AIC4.ANNO)
+      data/processed/val.json      (20% split — used by --val-manifest)
+      data/processed/manifest_full.json  (all sequences, for reference)
+
+  The raw manifest metadata slices (video_path, annotation_path etc.) are no
+  longer written — they are not needed by the training pipeline.
+
+UNCHANGED logic:
+  - make_crop() (context-pad → resize to SAVE_SIZE=511 → store corner bbox)
+  - sequential cap.read() for frame accuracy
+  - stratified 80/20 sequence-level split
+  - atomic JSON writes
+  - directory structure: crop511/{seq_key}/{frame:06d}.0.x.jpg
 """
 import os
 import sys
@@ -32,38 +45,38 @@ from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 
-# ── Project root resolution ────────────────────────────────────────────────
+# ── Project root ─────────────────────────────────────────────────────────────
 _THIS_DIR    = Path(__file__).resolve().parent
 _PROJ_ROOT   = _THIS_DIR.parent
 
-# ── Configuration ─────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 CONTEST_DATA_DIR = Path(os.environ.get(
     'CONTEST_DATA_DIR',
     str(_PROJ_ROOT.parent / 'AIC4-UAV-Tracker' / 'data' / 'contest_release')
 )).resolve()
 
-MANIFEST_PATH      = CONTEST_DATA_DIR / 'metadata' / 'contestant_manifest.json'
-OUTPUT_DIR         = _PROJ_ROOT / 'data' / 'processed'
-OUTPUT_IMAGE_ROOT  = OUTPUT_DIR / 'crop511'
-OUTPUT_JSON_FULL   = OUTPUT_DIR / 'manifest_full.json'
-OUTPUT_JSON_TRAIN  = OUTPUT_DIR / 'manifest_train.json'
-OUTPUT_JSON_VAL    = OUTPUT_DIR / 'manifest_val.json'
+MANIFEST_PATH     = CONTEST_DATA_DIR / 'metadata' / 'contestant_manifest.json'
+OUTPUT_DIR        = _PROJ_ROOT / 'data' / 'processed'
+OUTPUT_IMAGE_ROOT = OUTPUT_DIR / 'crop511'
 
-SAVE_SIZE          = 511
-CONTEXT_AMOUNT     = 0.5
-JPEG_QUALITY       = 90
-MIN_VALID_FRAMES   = 2
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXED output paths — these are what cfg.DATASET.AIC4.ANNO points to
+# ─────────────────────────────────────────────────────────────────────────────
+OUTPUT_JSON_TRAIN = OUTPUT_DIR / 'train.json'    # ← cfg.DATASET.AIC4.ANNO
+OUTPUT_JSON_VAL   = OUTPUT_DIR / 'val.json'      # ← --val-manifest
+OUTPUT_JSON_FULL  = OUTPUT_DIR / 'manifest_full.json'
 
-# ── Split configuration ───────────────────────────────────────────────────
-SPLIT_SEED         = 42
-SPLIT_TRAIN_RATIO  = 0.8
+SAVE_SIZE         = 511
+CONTEXT_AMOUNT    = 0.5
+JPEG_QUALITY      = 90
+MIN_VALID_FRAMES  = 2
+
+SPLIT_SEED        = 42
+SPLIT_TRAIN_RATIO = 0.8
 
 
 def parse_annotations(anno_path: Path) -> dict:
-    """
-    Parse annotation.txt → {frame_idx (int): [x1, y1, x2, y2]}.
-    Skips lines with w<=0 or h<=0 (occlusion/absence).
-    """
+    """Parse annotation.txt → {frame_idx (int): [x1, y1, x2, y2]}."""
     annos = {}
     if not anno_path.exists():
         return annos
@@ -87,7 +100,8 @@ def parse_annotations(anno_path: Path) -> dict:
 def make_crop(frame: np.ndarray, bbox_xyxy: list):
     """
     Context-crop frame around bbox, pad borders, resize to SAVE_SIZE.
-    Returns: (crop_resized, nx1, ny1, nx2, ny2) in crop-space, or None.
+    Returns (crop_resized, nx1, ny1, nx2, ny2) in crop-space, or None.
+    The target is always centred in the output crop.
     """
     x1, y1, x2, y2 = bbox_xyxy
     w_orig, h_orig = x2 - x1, y2 - y1
@@ -124,26 +138,28 @@ def make_crop(frame: np.ndarray, bbox_xyxy: list):
     if crop.size == 0 or crop.shape[0] < 1 or crop.shape[1] < 1:
         return None
 
-    crop_resized = cv2.resize(crop, (SAVE_SIZE, SAVE_SIZE), interpolation=cv2.INTER_LINEAR)
+    crop_resized = cv2.resize(crop, (SAVE_SIZE, SAVE_SIZE),
+                              interpolation=cv2.INTER_LINEAR)
 
-    # Map bbox to resized crop coordinates
-    scale = SAVE_SIZE / s_z
-    w_new = w_orig * scale
-    h_new = h_orig * scale
-    nx1   = (SAVE_SIZE - w_new) / 2.0
-    ny1   = (SAVE_SIZE - h_new) / 2.0
-    nx2   = nx1 + w_new
-    ny2   = ny1 + h_new
+    # Map bbox to resized crop coordinates.
+    # Target is centred in the crop, so cx_crop = cy_crop = SAVE_SIZE/2.
+    scale  = SAVE_SIZE / s_z
+    w_new  = w_orig * scale
+    h_new  = h_orig * scale
+    nx1    = (SAVE_SIZE - w_new) / 2.0
+    ny1    = (SAVE_SIZE - h_new) / 2.0
+    nx2    = nx1 + w_new
+    ny2    = ny1 + h_new
 
-    # Clamp
     nx1 = max(0.0, nx1); ny1 = max(0.0, ny1)
     nx2 = min(float(SAVE_SIZE), nx2); ny2 = min(float(SAVE_SIZE), ny2)
 
     return crop_resized, nx1, ny1, nx2, ny2
 
 
-def process_sequence_sequential(seq_dir: Path, video_path: Path, annos: dict) -> dict:
-    """Read video sequentially, crop & save annotated frames."""
+def process_sequence_sequential(seq_dir: Path, video_path: Path,
+                                 annos: dict) -> dict:
+    """Read video sequentially (NO cap.set()), crop and save annotated frames."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return {}
@@ -164,17 +180,20 @@ def process_sequence_sequential(seq_dir: Path, video_path: Path, annos: dict) ->
                 crop, nx1, ny1, nx2, ny2 = result
                 frame_key = '{:06d}'.format(frame_idx)
                 save_path = seq_dir / f'{frame_key}.0.x.jpg'
-                ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                ok, buf = cv2.imencode(
+                    '.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if ok:
                     save_path.write_bytes(buf.tobytes())
                     saved[frame_key] = [nx1, ny1, nx2, ny2]
         frame_idx += 1
+
     cap.release()
     return saved
 
 
-def split_sequences_deterministic(seq_keys: list, train_ratio: float, seed: int) -> tuple:
-    """Stratified sequence-level split preserving dataset distribution."""
+def split_sequences_deterministic(seq_keys: list, train_ratio: float,
+                                   seed: int) -> tuple:
+    """Stratified sequence-level split preserving per-dataset distribution."""
     groups = defaultdict(list)
     for k in seq_keys:
         ds = k.split("/")[0] if "/" in k else "unknown"
@@ -192,19 +211,22 @@ def split_sequences_deterministic(seq_keys: list, train_ratio: float, seed: int)
 
 
 def _atomic_json_write(data: dict, out_path: Path):
-    """Write JSON safely via temp file + rename."""
+    """Write JSON safely via temp file + atomic rename."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix('.json.tmp')
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(str(tmp), str(out_path))
+    print(f'  Written: {out_path}')
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=SPLIT_SEED)
+    parser.add_argument('--seed',        type=int,   default=SPLIT_SEED)
     parser.add_argument('--train-ratio', type=float, default=SPLIT_TRAIN_RATIO)
+    parser.add_argument('--skip-existing', action='store_true',
+                        help='Skip seq directories that already have crops')
     args = parser.parse_args()
 
     print(f'Contest data : {CONTEST_DATA_DIR}')
@@ -219,22 +241,22 @@ def main():
         manifest = json.load(f)
 
     train_data = manifest.get('train', {})
-    public_lb  = manifest.get('public_lb', {})
-    print(f'Training sequences: {len(train_data)} | Public LB: {len(public_lb)}')
+    print(f'Training sequences in manifest: {len(train_data)}')
 
     OUTPUT_IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ── output_annos: the crop-annotation dict that dataset.py reads ─────────
+    # Structure: {seq_key: {"0": {frame_key: [x1,y1,x2,y2], ...}}}
     output_annos = {}
     skip_count   = 0
 
     for seq_key, seq_info in tqdm(train_data.items(), desc='Preprocessing'):
-        # seq_key examples: "dataset1/Car_video_2", "dataset3/car1-n"
         video_path = CONTEST_DATA_DIR / seq_info['video_path']
         anno_path  = CONTEST_DATA_DIR / seq_info['annotation_path']
 
         if not video_path.exists() or not anno_path.exists():
-            tqdm.write(f'  SKIP (missing file): {seq_key}')
+            tqdm.write(f'  SKIP (missing): {seq_key}')
             skip_count += 1
             continue
 
@@ -243,14 +265,45 @@ def main():
             skip_count += 1
             continue
 
-        # 🔑 CRITICAL: Use seq_key for directory to match dataset.py exactly
         safe_dir = seq_key.replace('/', os.sep).replace('\\', os.sep)
-        seq_dir = OUTPUT_IMAGE_ROOT / safe_dir
+        seq_dir  = OUTPUT_IMAGE_ROOT / safe_dir
         seq_dir.mkdir(parents=True, exist_ok=True)
+
+        # Optional: skip re-processing if images already exist
+        if args.skip_existing:
+            existing = list(seq_dir.glob('*.x.jpg'))
+            if len(existing) >= MIN_VALID_FRAMES:
+                # Rebuild annotation dict from existing files
+                frame_anno = {}
+                for img_p in existing:
+                    frame_key = img_p.stem.split('.')[0]
+                    frame_int = int(frame_key)
+                    if frame_int in annos:
+                        x1, y1, x2, y2 = annos[frame_int]
+                        w_orig = x2 - x1
+                        h_orig = y2 - y1
+                        if w_orig > 0 and h_orig > 0:
+                            wc = w_orig + CONTEXT_AMOUNT * (w_orig + h_orig)
+                            hc = h_orig + CONTEXT_AMOUNT * (w_orig + h_orig)
+                            s_z = np.sqrt(wc * hc)
+                            scale = SAVE_SIZE / s_z
+                            w_new = w_orig * scale
+                            h_new = h_orig * scale
+                            nx1 = (SAVE_SIZE - w_new) / 2.0
+                            ny1 = (SAVE_SIZE - h_new) / 2.0
+                            frame_anno[frame_key] = [
+                                max(0.0, nx1), max(0.0, ny1),
+                                min(float(SAVE_SIZE), nx1 + w_new),
+                                min(float(SAVE_SIZE), ny1 + h_new)
+                            ]
+                if len(frame_anno) >= MIN_VALID_FRAMES:
+                    output_annos[seq_key] = {'0': frame_anno}
+                    continue
 
         try:
             saved = process_sequence_sequential(seq_dir, video_path, annos)
-        except Exception:
+        except Exception as e:
+            tqdm.write(f'  ERROR {seq_key}: {e}')
             skip_count += 1
             continue
 
@@ -258,36 +311,36 @@ def main():
             skip_count += 1
             continue
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Store crop annotations keyed as dataset.py expects:
+        #   output_annos[seq_key]["0"][frame_key] = [x1, y1, x2, y2]
+        # ─────────────────────────────────────────────────────────────────────
         output_annos[seq_key] = {'0': saved}
 
-    # ── Integrated Split ──────────────────────────────────────────────────
-    print(f'\n[SPLIT] Performing deterministic sequence-level split...')
+    print(f'\nProcessed: {len(output_annos)}  Skipped: {skip_count}')
+
+    if len(output_annos) == 0:
+        sys.exit('ERROR: no sequences processed. Check CONTEST_DATA_DIR.')
+
+    # ── Split ─────────────────────────────────────────────────────────────────
     all_keys = list(output_annos.keys())
     train_keys, val_keys = split_sequences_deterministic(
         all_keys, args.train_ratio, args.seed)
 
-    print(f'[SPLIT] Train: {len(train_keys)} ({len(train_keys)/len(all_keys)*100:.1f}%)')
-    print(f'[SPLIT] Val  : {len(val_keys)} ({len(val_keys)/len(all_keys)*100:.1f}%)')
+    print(f'\n[SPLIT] Train: {len(train_keys)}  Val: {len(val_keys)}')
 
-    # ── Build Manifests ───────────────────────────────────────────────────
-    manifest_full = {
-        "train": {k: train_data[k] for k in all_keys},
-        "public_lb": public_lb
-    }
-    manifest_train = {
-        "train": {k: train_data[k] for k in train_keys},
-        "public_lb": {}
-    }
-    manifest_val = {
-        "train": {k: train_data[k] for k in val_keys},
-        "public_lb": {}
-    }
+    train_annos = {k: output_annos[k] for k in train_keys}
+    val_annos   = {k: output_annos[k] for k in val_keys}
 
-    _atomic_json_write(manifest_full, OUTPUT_JSON_FULL)
-    _atomic_json_write(manifest_train, OUTPUT_JSON_TRAIN)
-    _atomic_json_write(manifest_val, OUTPUT_JSON_VAL)
+    # ── Write JSON files ──────────────────────────────────────────────────────
+    # train.json and val.json are the CROP ANNOTATION files (what dataset.py reads).
+    # They have the structure dataset.py expects: {seq_key: {"0": {frame: bbox}}}
+    print('\nWriting annotation JSONs...')
+    _atomic_json_write(output_annos, OUTPUT_JSON_FULL)
+    _atomic_json_write(train_annos,  OUTPUT_JSON_TRAIN)   # cfg points here
+    _atomic_json_write(val_annos,    OUTPUT_JSON_VAL)
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
     total_frames = sum(len(v['0']) for v in output_annos.values())
     train_frames = sum(len(output_annos[k]['0']) for k in train_keys)
     val_frames   = sum(len(output_annos[k]['0']) for k in val_keys)
@@ -295,12 +348,17 @@ def main():
     print(f'\n{"="*70}')
     print(f'  PREPROCESSING COMPLETE')
     print(f'{"="*70}')
-    print(f'  Processed : {len(output_annos)} | Skipped: {skip_count}')
-    print(f'  Frames    : {total_frames:,} (Train: {train_frames:,} | Val: {val_frames:,})')
-    print(f'  Manifests → {OUTPUT_DIR}')
+    print(f'  Sequences : {len(output_annos)} total '
+          f'(Train: {len(train_keys)} | Val: {len(val_keys)})')
+    print(f'  Frames    : {total_frames:,} '
+          f'(Train: {train_frames:,} | Val: {val_frames:,})')
     print(f'  Crops     → {OUTPUT_IMAGE_ROOT}')
+    print(f'  train.json→ {OUTPUT_JSON_TRAIN}')
+    print(f'  val.json  → {OUTPUT_JSON_VAL}')
     print(f'{"="*70}\n')
-    print(f'Next: python tools/train.py --val-manifest {OUTPUT_JSON_VAL}')
+    print(f'Verify with:')
+    print(f'  VALIDATE_ON_INIT=1 python tools/train.py')
+    print(f'  python tools/validate_dataset.py --mode meta')
 
 
 if __name__ == '__main__':
