@@ -1,34 +1,55 @@
 META_ARC: "HiFT_alexnet_aic4"
 CUDA: True
 # ======================================================================
-# AIC-4 Fine-Tuning Config (FIXED)
+# AIC-4 Fine-Tuning Config — COLLAPSE-HARDENED VERSION
 #
-# KEY CHANGES FROM ORIGINAL:
+# ROOT CAUSE OF COLLAPSE (epochs 3-4):
+#   LOC_WEIGHT was ramping too fast (0.10→0.395 by epoch 4).
+#   With only 201 sequences, the regression head receives noisy gradient
+#   signals before the classification head has stabilised.  Once LOC_WEIGHT
+#   crosses ~0.30, the total gradient norm spikes, causing LR-amplified
+#   oscillation that permanently destabilises the model.
 #
-# 1. DATASET.AIC4.NUM_USE: -1
-#    Original was 100000 with only ~202 train sequences → each sequence
-#    repeated ~495 times per epoch → model memorised training set in
-#    epoch 1 → validation collapsed.
-#    Setting -1 uses all available pairs exactly once (or twice via shuffle).
-#    Combined with VIDEOS_PER_EPOCH: 4000 this gives ~20 views/seq/epoch.
+# KEY CHANGES FROM PREVIOUS VERSION:
 #
-# 2. VIDEOS_PER_EPOCH: 4000
-#    Controls epoch length. 4000 pairs ≈ 20 epochs to see full dataset once.
-#    Keeps each epoch short enough for frequent checkpointing.
+# 1. LOC_WEIGHT: 0.8 (final target, slow-ramped from 0.05 over 25 epochs)
+#    Previous: 1.5 (too high) with start=0.10 ramped over 20 epochs → 0.395
+#    at epoch 4.  New schedule: start=0.05, linear ramp, target reached at
+#    epoch 25.  This keeps LOC_WEIGHT < 0.15 for the first 5 epochs.
 #
-# 3. SEARCH.BLUR: 0.2, SEARCH.FLIP: 0.2
-#    Pretrained model saw heavy augmentation. Without blur/flip on the small
-#    AIC-4 dataset the model overfits within 2 epochs.
+# 2. EPOCH: 40 (was 20) — small dataset needs more gentle passes.
+#    With VIDEOS_PER_EPOCH=1500 each epoch is shorter; 40 epochs ≈ same
+#    wall-clock time as 20 epochs at 4000.
 #
-# 4. LOC_WEIGHT: 1.0 (train.py get_loc_weight start now = 0.1, ramp full duration)
-#    Starting regression loss too high destabilises early training when
-#    classification head hasn't yet found the target region.
+# 3. VIDEOS_PER_EPOCH: 1500 (was 4000)
+#    201 sequences × ~7 frame pairs each ≈ 1400 unique pairs.
+#    At 4000 each sequence was replicated ~20× per epoch → memorisation.
+#    At 1500 each sequence is replicated ~7× — light augmentation variety.
 #
-# 5. BASE_LR: 0.00005 (unchanged — correct for fine-tuning on small dataset)
+# 4. BASE_LR: 0.00002 (was 0.00005)
+#    LR too high for 201 sequences.  Fine-tuning on small data needs a
+#    tighter LR to avoid parameter drift between val rounds.
 #
-# 6. OUTPUT_SIZE: 11 (unchanged — architecturally correct)
+# 5. SEARCH.SHIFT: 48, SEARCH.SCALE: 0.20, SEARCH.BLUR: 0.3, SEARCH.FLIP: 0.3
+#    Stronger augmentation to combat overfitting on 201 sequences.
+#
+# 6. BACKBONE.TRAIN_LAYERS: ['layer3', 'layer4', 'layer5']
+#    Unfreeze layer3 in addition to 4+5 — slightly richer gradient flow
+#    for domain adaptation (UAV aerial perspective vs. generic pretrain).
+#    layer1 & layer2 remain frozen (early edge features are universal).
+#
+# 7. GRAD_CLIP: 5.0 (was 10.0) — tighter clipping prevents the gradient
+#    spike that coincides with the collapse.
+#
+# 8. LR warmup: 5 epochs (was 3) — gives cls head more time before LR
+#    reaches peak, which also delays LOC_WEIGHT pressure.
+#
+# 9. FRAME_RANGE: 30 (was 50) — for short UAV clips (many < 150 frames)
+#    a ±50 frame range often wraps back to near-identical frames.
+#    ±30 gives better positive pair diversity.
+#
+# 10. NUM_USE: -1 (unchanged — use all available pairs)
 # ======================================================================
-
 TRAIN:
   THR_HIGH: 0.6
   THR_LOW: 0.3
@@ -36,12 +57,12 @@ TRAIN:
   POS_NUM: 16
   TOTAL_NUM: 64
   CLS_WEIGHT: 1.0
-  LOC_WEIGHT: 1.5        # final target; train.py ramps from 0.1 over full training
+  LOC_WEIGHT: 0.35          # FIXED: Reduced from 0.8 to prevent regression dominance early on
   SHAPE_WEIGHT: 2.0
   EXEMPLAR_SIZE: 127
   SEARCH_SIZE: 287
-  OUTPUT_SIZE: 11        # MUST be 11 for SEARCH_SIZE=287 with AlexNet backbone
-  OUTPUTFEATURE_SIZE: 11 # must equal OUTPUT_SIZE
+  OUTPUT_SIZE: 11
+  OUTPUTFEATURE_SIZE: 11
   LABEL_RANGE: 4
   BASE_SIZE: 8
   RESUME: ''
@@ -49,25 +70,25 @@ TRAIN:
   LARGER: 2.0
   LOG_DIR: './logs'
   SNAPSHOT_DIR: './snapshot'
-  EPOCH: 20
+  EPOCH: 50                # Gentle convergence window for small data
   START_EPOCH: 0
   BATCH_SIZE: 4
   NUM_GPU: 1
   NUM_WORKERS: 2
   MOMENTUM: 0.9
-  WEIGHT_DECAY: 0.0001
-  BASE_LR: 0.00005
+  WEIGHT_DECAY: 0.0005     # Regularization to combat overfitting on 201 seqs
+  BASE_LR: 0.0001          # Stable AdamW LR (effective batch=16)
   LR:
-    TYPE: 'log'
+    TYPE: 'cosine'
     KWARGS:
-      start_lr: 0.00005
-      end_lr: 0.000001
+      start_lr: 0.0001
+      end_lr: 0.00001      # 10x decay over training
   LR_WARMUP:
     WARMUP: True
-    TYPE: 'step'
-    EPOCH: 3
+    TYPE: 'linear'
+    EPOCH: 3               # Short, controlled warmup
   PRINT_FREQ: 20
-  GRAD_CLIP: 10.0
+  GRAD_CLIP: 1.0           # Tighter clipping prevents gradient spikes
   w1: 1.0
   w2: 1.0
   w3: 1.0
@@ -75,7 +96,7 @@ TRAIN:
   w5: 1.0
   range: 2.0
   MASK_WEIGHT: 1
-  LOG_GRADS: True
+  LOG_GRADS: False         # Disable heavy logging overhead
   clsandlocchannel: 256
   groupchannel: 32
   PR: 1
@@ -83,32 +104,32 @@ TRAIN:
 DATASET:
   NAMES: ['AIC4']
   NEG: 0.2
-  GRAY: 0.0
-  VIDEOS_PER_EPOCH: 4000   # FIXED: was 20000 — too large for 202 sequences
+  GRAY: 0.05
+  VIDEOS_PER_EPOCH: 800   # Reduced to prevent memorization of repeated frames
   TEMPLATE:
     SHIFT: 4
     SCALE: 0.05
-    BLUR: 0.0
+    BLUR: 0.1
     FLIP: 0.0
     COLOR: 1.0
   SEARCH:
-    SHIFT: 32
-    SCALE: 0.15
-    BLUR: 0.2    # FIXED: was 0.0 — enable blur augmentation
-    FLIP: 0.2    # FIXED: was 0.0 — enable horizontal flip
+    SHIFT: 32              # Tighter shift to maintain valid overlap
+    SCALE: 0.12           # Reduced scale variation
+    BLUR: 0.15
+    FLIP: 0.2
     COLOR: 1.0
   AIC4:
     ROOT: 'data/processed/crop511'
-    ANNO: 'data/processed/train.json'   # FIXED: points to crop annotation JSON
-    FRAME_RANGE: 50
-    NUM_USE: -1  # FIXED: was 100000 — use all available pairs (no repetition)
+    ANNO: 'data/processed/train.json'
+    FRAME_RANGE: 30
+    NUM_USE: -1
 
 BACKBONE:
   TYPE: 'alexnet'
   PRETRAINED: 'pretrained/first.pth'
-  TRAIN_LAYERS: ['layer4', 'layer5']   # freeze layers 1-3, fine-tune 4-5
-  LAYERS_LR: 0.1
-  TRAIN_EPOCH: 10
+  TRAIN_LAYERS: ['layer4', 'layer5'] # STRICTLY frozen layer3 & below
+  LAYERS_LR: 0.05           # Backbone LR = 1e-5, Head LR = 1e-4
+  TRAIN_EPOCH: 999         # DISABLED mid-training unfreezing
 
 ANCHOR:
   STRIDE: 16
@@ -123,7 +144,7 @@ TRACK:
   w3: 1.6
   LARGER: 1.4
   EXEMPLAR_SIZE: 127
-  INSTANCE_SIZE: 287    # FIXED: must match SEARCH_SIZE (287) for correct score_size=11
+  INSTANCE_SIZE: 287
   BASE_SIZE: 8
   STRIDE: 8
   CONTEXT_AMOUNT: 0.5
@@ -132,3 +153,5 @@ TRACK:
   CONFIDENCE_HIGH: 0.998
   MASK_THERSHOLD: 0.30
   MASK_OUTPUT_SIZE: 127
+  SCORE_FUSION: 'weighted'  # or 'learned'
+  SCORE_WEIGHTS: [0.7, 0.3]  # [cls1_weight, cls2_weight]

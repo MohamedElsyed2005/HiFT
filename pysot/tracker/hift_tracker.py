@@ -200,9 +200,13 @@ class HiFTTracker(SiameseTracker):
         pred_bbox = self.generate_anchor(outputs['loc'])   # (4, 121) [cx,cy,w,h]
 
         # FIX #3: Apply sigmoid to cls2 before combining scores
-        score1 = self._convert_score(outputs['cls1']) * cfg.TRACK.w2
-        score2 = self._convert_cls2_score(outputs['cls2']) * cfg.TRACK.w3
-        score = (score1 + score2) / 2.0
+        score1 = self._convert_score(outputs['cls1']) * cfg.TRACK.w2       # softmax prob ∈ [0,1] -> cross_valid
+        score2 = self._convert_cls2_score(outputs['cls2']) * cfg.TRACK.w3  # sigmoid prob ∈ [0,1] -> BCE
+        # trained with different gradients.  Simply averaging assumes equal reliability, which is rarely true.
+        # FIX: Use validation-tuned weights or learned fusion
+        # In tracker
+        weights = cfg.TRACK.SCORE_WEIGHTS
+        score = score1 * weights[0] + score2 * weights[1]
 
         # Scale and aspect-ratio penalty
         def change(r):
@@ -237,7 +241,21 @@ class HiFTTracker(SiameseTracker):
         self.center_pos = np.array([cx, cy])
         self.size = np.array([width, height])
 
+        CONFIDENCE_THRESHOLD = 0.25
+        # ===== failure detection =====
+        failed = False
+        if float(score[best_idx]) < CONFIDENCE_THRESHOLD:
+            failed = True
+            
+        if failed:
+            return {
+                'bbox': None,
+                'best_score': float(score[best_idx]),
+                'failed': True
+            }
+
         return {
             'bbox': [cx - width / 2, cy - height / 2, width, height],
-            'best_score': float(score[best_idx])
+            'best_score': float(score[best_idx]),
+            'failed': False
         }

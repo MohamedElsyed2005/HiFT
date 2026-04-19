@@ -110,17 +110,20 @@ def make_crop(frame: np.ndarray, bbox_xyxy: list):
 
     cx = x1 + w_orig / 2.0
     cy = y1 + h_orig / 2.0
+
     wc  = w_orig + CONTEXT_AMOUNT * (w_orig + h_orig)
     hc  = h_orig + CONTEXT_AMOUNT * (w_orig + h_orig)
     s_z = np.sqrt(wc * hc)
-    half   = s_z / 2.0
-    ix1    = int(np.floor(cx - half))
-    iy1    = int(np.floor(cy - half))
-    side   = int(np.ceil(s_z))
-    ix2    = ix1 + side
-    iy2    = iy1 + side
+
+    half = s_z / 2.0
+    ix1  = int(np.floor(cx - half))
+    iy1  = int(np.floor(cy - half))
+    side = int(np.ceil(s_z))
+    ix2  = ix1 + side
+    iy2  = iy1 + side
 
     img_h, img_w = frame.shape[:2]
+
     pad_top    = max(0, -iy1)
     pad_bottom = max(0, iy2 - img_h)
     pad_left   = max(0, -ix1)
@@ -134,25 +137,39 @@ def make_crop(frame: np.ndarray, bbox_xyxy: list):
         iy1 += pad_top;  iy2 += pad_top
         ix1 += pad_left; ix2 += pad_left
 
-    crop = frame[max(0, iy1):iy2, max(0, ix1):ix2]
+    crop = frame[iy1:iy2, ix1:ix2]
+
     if crop.size == 0 or crop.shape[0] < 1 or crop.shape[1] < 1:
         return None
 
-    crop_resized = cv2.resize(crop, (SAVE_SIZE, SAVE_SIZE),
-                              interpolation=cv2.INTER_LINEAR)
+    crop_resized = cv2.resize(
+        crop, (SAVE_SIZE, SAVE_SIZE),
+        interpolation=cv2.INTER_LINEAR
+    )
 
-    # Map bbox to resized crop coordinates.
-    # Target is centred in the crop, so cx_crop = cy_crop = SAVE_SIZE/2.
-    scale  = SAVE_SIZE / s_z
-    w_new  = w_orig * scale
-    h_new  = h_orig * scale
-    nx1    = (SAVE_SIZE - w_new) / 2.0
-    ny1    = (SAVE_SIZE - h_new) / 2.0
-    nx2    = nx1 + w_new
-    ny2    = ny1 + h_new
+    # ===== Correct bbox mapping =====
+    scale = SAVE_SIZE / s_z
+    w_new = w_orig * scale
+    h_new = h_orig * scale
 
-    nx1 = max(0.0, nx1); ny1 = max(0.0, ny1)
-    nx2 = min(float(SAVE_SIZE), nx2); ny2 = min(float(SAVE_SIZE), ny2)
+    nx1 = (SAVE_SIZE - w_new) / 2.0
+    ny1 = (SAVE_SIZE - h_new) / 2.0
+    nx2 = nx1 + w_new
+    ny2 = ny1 + h_new
+
+    # ===== Clamp =====
+    nx1 = max(0.0, nx1)
+    ny1 = max(0.0, ny1)
+    nx2 = min(float(SAVE_SIZE), nx2)
+    ny2 = min(float(SAVE_SIZE), ny2)
+
+    # ===== VALIDATION =====
+    if nx1 >= nx2 or ny1 >= ny2:
+        return None
+
+    min_size = 2.0
+    if (nx2 - nx1) < min_size or (ny2 - ny1) < min_size:
+        return None
 
     return crop_resized, nx1, ny1, nx2, ny2
 
@@ -192,21 +209,54 @@ def process_sequence_sequential(seq_dir: Path, video_path: Path,
 
 
 def split_sequences_deterministic(seq_keys: list, train_ratio: float,
-                                   seed: int) -> tuple:
-    """Stratified sequence-level split preserving per-dataset distribution."""
+                                   seed: int, annos=None) -> tuple:
+    """Stratified sequence-level split preserving dataset + length distribution."""
+    from collections import defaultdict
+    import numpy as np
+
+    def get_length_bucket(n_frames):
+        if n_frames < 100:
+            return 'short'
+        elif n_frames < 300:
+            return 'medium'
+        else:
+            return 'long'
+
     groups = defaultdict(list)
+
     for k in seq_keys:
         ds = k.split("/")[0] if "/" in k else "unknown"
-        groups[ds].append(k)
+
+        # ===== length-aware stratification =====
+        if annos is not None and k in annos:
+            try:
+                obj = next(iter(annos[k].values()))
+                n_frames = len(obj.get('frames', []))
+            except Exception:
+                n_frames = 0
+        else:
+            n_frames = 0
+
+        length_bucket = get_length_bucket(n_frames)
+
+        key = f"{ds}_{length_bucket}"
+        groups[key].append(k)
 
     train_keys, val_keys = [], []
     rng = np.random.default_rng(seed)
-    for ds in sorted(groups.keys()):
-        seqs = groups[ds]
+
+    for key in sorted(groups.keys()):
+        seqs = groups[key]
         rng.shuffle(seqs)
+
+        if len(seqs) == 0:
+            continue
+
         idx = max(1, int(len(seqs) * train_ratio))
+
         train_keys.extend(seqs[:idx])
         val_keys.extend(seqs[idx:])
+
     return train_keys, val_keys
 
 

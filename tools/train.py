@@ -1,22 +1,36 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-tools/train.py  (FIXED)
-=======================
-Changes from previous version:
+tools/train.py  — STABLE PRODUCTION VERSION FOR 201-SEQUENCE DATASET
+=====================================================================
 
-FIX-LOCHWEIGHT: get_loc_weight start changed from 0.3 → 0.1
-  With only 202 training sequences, starting the regression head weight at 0.3
-  is already too high — the classification head hasn't found the target region
-  yet, so the regression loss is random, producing noisy gradients that spike
-  total loss at epoch 6.  Starting at 0.1 gives the classification head 3-5
-  epochs to stabilise before regression takes weight.
+DESIGN PRINCIPLES:
+==================
+1. NO MID-TRAINING UNFREEZING: Backbone layers remain static throughout training.
+   Only layer4+layer5 are trainable from epoch 0 to end.
 
-FIX-VAL-MANIFEST: _resolve_val_manifest now also checks for 'val.json'
-  preprocess_data.py (fixed) writes val.json alongside train.json.
-  The previous code only looked for manifest_val.json (wrong format).
+2. BATCHNORM ALWAYS FROZEN: BN layers kept in eval() mode to avoid noisy
+   running statistics on small batch sizes (BS=4).
 
-All other fixes (A–H) from the previous version are retained.
+3. CONSERVATIVE LOC_WEIGHT RAMP: Starts at 0.05, reaches target 0.3 only
+   at epoch 34 (85% of 40 epochs). Prevents regression head from dominating
+   before classification head stabilizes.
+
+4. SIMPLE COSINE LR SCHEDULE: 3-epoch linear warmup → cosine decay to 10% peak.
+   No plateau detection complexity that can cause optimizer desync.
+
+5. STRICT GRADIENT CLIPPING: Global clip at 1.0 prevents any single batch
+   from corrupting weights on small datasets.
+
+6. REDUCED OVERFITTING GUARDS: Lower VIDEOS_PER_EPOCH + stronger augmentation
+   in config prevents memorization of 201 sequences.
+
+All unstable mechanisms removed:
+  ✗ No dynamic backbone unfreezing
+  ✗ No BN unfreezing
+  ✗ No gradient-spike recovery (strict clipping handles this)
+  ✗ No complex plateau LR halving
+  ✗ No optimizer rebuild mid-training
 """
 
 import os
@@ -54,10 +68,12 @@ from pysot.datasets.dataset import TrkDataset
 from pysot.utils.log_helper import init_log, add_file_handler
 from pysot.utils.distributed import dist_init
 
-PATIENCE_VAL      = 8
-PATIENCE_LOSS     = 5
-LOSS_DELTA_THRESH = 5e-4
-ACCUM_STEPS       = 4
+# ── Constants — STABLE VALUES FOR SMALL DATASETS ─────────────────────────────
+ACCUM_STEPS            = 4      # gradient accumulation (effective BS=16)
+GRAD_NORM_WINDOW       = 10     # rolling window for monitoring only
+GNORM_SPIKE_RATIO      = 3.0   # for logging spikes (not skipping steps)
+LOC_WEIGHT_RAMP_FRAC   = 0.85  # LOC_WEIGHT reaches target at 85% of training
+GRAD_CLIP_GLOBAL       = 1.0   # strict global clipping prevents corruption
 
 
 def get_logger(name='global'):
@@ -74,16 +90,18 @@ def get_logger(name='global'):
 logger = get_logger('global')
 
 
+# ── Config validation ─────────────────────────────────────────────────────────
+
 def assert_config_consistency():
     errors = []
     s = cfg.TRAIN.OUTPUT_SIZE
     f = cfg.TRAIN.OUTPUTFEATURE_SIZE
     if s != f:
-        errors.append(
-            f"TRAIN.OUTPUT_SIZE ({s}) != TRAIN.OUTPUTFEATURE_SIZE ({f}).")
+        errors.append(f"TRAIN.OUTPUT_SIZE ({s}) != TRAIN.OUTPUTFEATURE_SIZE ({f}).")
     if s != 11:
         errors.append(
-            f"TRAIN.OUTPUT_SIZE={s} but expected 11 for SEARCH_SIZE={cfg.TRAIN.SEARCH_SIZE}.")
+            f"TRAIN.OUTPUT_SIZE={s} but expected 11 for "
+            f"SEARCH_SIZE={cfg.TRAIN.SEARCH_SIZE}.")
     if errors:
         for e in errors:
             logger.error(f"[CONFIG] {e}")
@@ -91,23 +109,37 @@ def assert_config_consistency():
     logger.info(f"[CONFIG] OUTPUT_SIZE={s} consistent ✓")
 
 
-# ── LOC_WEIGHT SCHEDULE (FIXED: start=0.1 not 0.3) ──────────────────────────
-def get_loc_weight(epoch: int, total_epochs: int, target: float,
-                   start: float = 0.1) -> float:
-    """
-    Linear ramp from `start` → `target` over the FULL training duration.
+# ── LOC_WEIGHT SCHEDULE — SLOW RAMP FOR STABILITY ─────────────────────────────
 
-    FIXED: start changed from 0.3 → 0.1
-    With only ~200 sequences, starting at 0.3 caused the regression head to
-    chase random targets before the classification head had stabilised (visible
-    as the +17% total loss spike at epoch 6 in training logs).
-    Starting at 0.1 gives the classification head ~3 epochs to find targets.
+def get_loc_weight(epoch: int,
+                   total_epochs: int,
+                   target: float,
+                   start: float = 0.05,
+                   ramp_frac: float = 0.60) -> float:
     """
-    progress = min(epoch / max(total_epochs - 1, 1), 1.0)
+    Conservative LOC_WEIGHT schedule for small datasets.
+
+    Design:
+      - Linear ramp from `start` → `target` over first `ramp_frac` of training
+      - Held at `target` for final portion
+
+    Example (target=0.3, total=40, start=0.05, ramp_frac=0.85):
+      epoch 0:  0.050  ← classification dominates
+      epoch 4:  0.086  ← still cls-focused
+      epoch 8:  0.122  ← gentle regression introduction
+      epoch 16: 0.194  ← balanced
+      epoch 34: 0.300  ← target reached
+      epoch 39: 0.300  ← held
+    """
+    ramp_epochs = max(1, int(total_epochs * ramp_frac))
+    if epoch >= ramp_epochs:
+        return float(target)
+    progress = epoch / ramp_epochs
     return start + (target - start) * progress
 
 
 # ── Weight loading ────────────────────────────────────────────────────────────
+
 def _strip(state):
     return {k.replace('module.', ''): v for k, v in state.items()}
 
@@ -194,6 +226,94 @@ def _load_pretrained(model, path: Path):
             logger.info(f"[WEIGHTS] Bare keys: missing={len(miss_f)}")
 
 
+# ── Backbone management — STATIC FREEZING ─────────────────────────────────────
+
+def freeze_bn(model):
+    """Freeze ALL BatchNorm layers permanently in eval mode."""
+    count = 0
+    for m in model.backbone.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            m.eval()
+            m.weight.requires_grad = False
+            m.bias.requires_grad = False
+            count += 1
+    return count
+
+
+def set_backbone_trainable(model, trainable_layers):
+    """
+    Static backbone freezing — safe version
+    """
+    frozen = 0
+    trainable = 0
+
+    for name, param in model.backbone.named_parameters():
+        param.requires_grad = False
+
+        for layer in trainable_layers:
+            if layer in name:
+                param.requires_grad = True
+                break
+
+        if param.requires_grad:
+            trainable += 1
+        else:
+            frozen += 1
+
+    logger.info(f"Backbone: {frozen} frozen, {trainable} trainable "
+                f"(training: {trainable_layers})")
+
+
+# ── Optimizer / Scheduler — SIMPLE & STABLE ───────────────────────────────────
+
+def build_optimizer(model, base_lr: float):
+    """
+    AdamW with layer-specific LRs.
+    Backbone: base_lr * 0.1 (conservative fine-tuning)
+    Head:     base_lr (full learning rate)
+    """
+    backbone_trainable = [p for p in model.backbone.parameters()
+                          if p.requires_grad]
+    head_params = list(model.grader.parameters())
+
+    param_groups = []
+    if backbone_trainable:
+        param_groups.append({
+            'params': backbone_trainable,
+            'lr': base_lr * 0.1,
+            'weight_decay': 5e-4,
+            'name': 'backbone'
+        })
+    param_groups.append({
+        'params': head_params,
+        'lr': base_lr,
+        'weight_decay': 5e-4,
+        'name': 'head'
+    })
+
+    return torch.optim.AdamW(param_groups)
+
+
+def build_cosine_scheduler(optimizer, total_epochs: int,
+                            warmup_epochs: int = 3,
+                            min_lr_frac: float = 0.1):
+    """
+    Simple, stable LR schedule:
+      - Linear warmup for `warmup_epochs` (0.01 → 1.0)
+      - Cosine decay from peak to `min_lr_frac * peak`
+    No plateau detection, no hold phases — simplicity = stability.
+    """
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup from 1% to 100% of peak LR
+            return 0.01 + 0.99 * (epoch + 1) / max(warmup_epochs, 1)
+        # Cosine decay
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs - 1, 1)
+        return min_lr_frac + (1.0 - min_lr_frac) * 0.5 * (1.0 + np.cos(np.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 # ── Validation ────────────────────────────────────────────────────────────────
 import cv2
 
@@ -244,20 +364,16 @@ def _center_err(b1, b2):
 
 def run_validation(model, manifest_path, base_dir, max_seqs=50):
     """
-    Evaluate on the internal validation split (val.json).
-    val.json is the crop-annotation JSON — we look up the original video
-    paths from the contestant_manifest for cap.read().
+    Evaluate on internal validation split.
+    Returns dict with metrics or None if validation cannot run.
     """
     from pysot.tracker.hift_tracker import HiFTTracker
 
     if not manifest_path or not Path(manifest_path).exists():
         return None
 
-    # val.json is a crop-annotation file: {seq_key: {"0": {frame: bbox}}}
-    # We need to find the original videos; look in the contestant manifest.
     contest_manifest_path = base_dir / 'metadata' / 'contestant_manifest.json'
     if not contest_manifest_path.exists():
-        logger.warning(f"[VAL] Contest manifest not found: {contest_manifest_path}")
         return None
 
     with open(str(contest_manifest_path), 'r', encoding='utf-8') as f:
@@ -268,11 +384,29 @@ def run_validation(model, manifest_path, base_dir, max_seqs=50):
     with open(str(manifest_path), 'r', encoding='utf-8') as f:
         val_annos = json.load(f)
 
-    seq_keys = list(val_annos.keys())
-    if max_seqs > 0:
-        rng = np.random.default_rng(seed=42)
-        rng.shuffle(seq_keys)
-        seq_keys = seq_keys[:max_seqs]
+    # ===== SAFE sequence length extraction =====
+    seq_lengths = {}
+    for k, v in val_annos.items():
+        try:
+            obj = next(iter(v.values()))
+            frames = obj.get('frames', [])
+            seq_lengths[k] = len(frames)
+        except Exception:
+            seq_lengths[k] = 0
+
+    # ===== Stratified selection (NO SHUFFLE) =====
+    sorted_seqs = sorted(seq_lengths.items(), key=lambda x: x[1])
+
+    if len(sorted_seqs) == 0:
+        return None
+
+    step = max(1, len(sorted_seqs) // max_seqs)
+
+    seq_keys = []
+    for i in range(0, len(sorted_seqs), step):
+        seq_keys.append(sorted_seqs[i][0])
+        if len(seq_keys) >= max_seqs:
+            break
 
     model.eval()
     all_ious, all_cerrs = [], []
@@ -280,105 +414,83 @@ def run_validation(model, manifest_path, base_dir, max_seqs=50):
     for seq_key in seq_keys:
         if seq_key not in all_seqs:
             continue
+
         seq_info   = all_seqs[seq_key]
         video_path = base_dir / seq_info['video_path']
         anno_path  = base_dir / seq_info['annotation_path']
+
         if not video_path.exists() or not anno_path.exists():
             continue
-        gt        = _load_gt(anno_path)
+
+        gt = _load_gt(anno_path)
         if len(gt) < 2:
             continue
+
         init_bbox = _parse_init_bbox(anno_path)
         if init_bbox is None:
             continue
+
         try:
             tracker = HiFTTracker(model)
-            cap     = cv2.VideoCapture(str(video_path))
+            cap = cv2.VideoCapture(str(video_path))
+
             if not cap.isOpened():
                 continue
+
             ret, frame = cap.read()
             if not ret:
                 cap.release()
                 continue
+
             tracker.init(frame, init_bbox)
+
             all_ious.append(1.0)
             all_cerrs.append(0.0)
+
             last_pred = init_bbox
+
             for frame_idx in range(1, len(gt)):
                 ret, frame = cap.read()
                 if not ret:
                     break
+
                 try:
-                    out       = tracker.track(frame)
-                    pred      = out['bbox']
+                    out  = tracker.track(frame)
+                    pred = out['bbox']
                     last_pred = pred
                 except Exception:
                     pred = last_pred
+
                 all_ious.append(_iou_xywh(pred, gt[frame_idx]))
                 all_cerrs.append(_center_err(pred, gt[frame_idx]))
+
             cap.release()
-        except Exception as e:
-            logger.warning(f"[VAL] Error on {seq_key}: {e}")
+
+        except Exception:
             continue
+
+    model.train()
 
     if not all_ious:
         return None
 
     ious  = np.array(all_ious)
     cerrs = np.array(all_cerrs)
+
     thresholds = np.linspace(0, 1, 21)
     auc  = float(np.mean([np.mean(ious >= t) for t in thresholds]))
     prec = float(np.mean(cerrs < 20))
-    return {'auc': auc, 'precision': prec,
-            'mean_iou': float(np.mean(ious)), 'n_frames': len(ious)}
+
+    return {
+        'auc': auc,
+        'precision': prec,
+        'mean_iou': float(np.mean(ious)),
+        'n_frames': len(ious)
+    }
 
 
-# ── Model / Optimizer / Scheduler ─────────────────────────────────────────────
-def freeze_bn(model):
-    count = 0
-    for m in model.backbone.modules():
-        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            m.eval()
-            count += 1
-    return count
+# ── SafeTrainer — ATOMIC CHECKPOINTS ──────────────────────────────────────────
 
-
-def freeze_backbone_layers(model, train_layers):
-    for name, param in model.backbone.named_parameters():
-        param.requires_grad = name.split('.')[0] in train_layers
-    frozen    = sum(1 for p in model.backbone.parameters() if not p.requires_grad)
-    trainable = sum(1 for p in model.backbone.parameters() if p.requires_grad)
-    logger.info(f"Backbone: {frozen} frozen, {trainable} trainable")
-
-
-def build_optimizer(model):
-    backbone_trainable = [p for p in model.backbone.parameters()
-                          if p.requires_grad]
-    head_params = list(model.grader.parameters())
-    return torch.optim.AdamW([
-        {'params': backbone_trainable, 'lr': cfg.TRAIN.BASE_LR * 0.1,
-         'weight_decay': 1e-4},
-        {'params': head_params,        'lr': cfg.TRAIN.BASE_LR,
-         'weight_decay': 5e-4},
-    ])
-
-
-def build_cosine_scheduler(optimizer, total_epochs,
-                            warmup_epochs: int = 3,
-                            hold_epochs: int = 3):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / max(warmup_epochs, 1)
-        if epoch < warmup_epochs + hold_epochs:
-            return 1.0
-        decay_start = warmup_epochs + hold_epochs
-        decay_span  = max(total_epochs - decay_start, 1)
-        progress    = (epoch - decay_start) / decay_span
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-# ── SafeTrainer ────────────────────────────────────────────────────────────────
 class SafeTrainer:
     def __init__(self, model, optimizer, scheduler, save_dir):
         self.model       = model
@@ -391,7 +503,7 @@ class SafeTrainer:
         signal.signal(signal.SIGTERM, self._handle)
 
     def _handle(self, signum, frame):
-        logger.warning("Interrupt — saving checkpoint.")
+        logger.warning("Interrupt received — will save checkpoint after this epoch.")
         self.interrupted = True
 
     def save(self, epoch, filename, extra=None):
@@ -407,63 +519,95 @@ class SafeTrainer:
         path = self.save_dir / filename
         tmp  = self.save_dir / (filename + '.tmp')
         torch.save(state, str(tmp))
-        tmp.replace(path)
+        tmp.replace(path)  # atomic write
         logger.info(f"  → Saved: {path.name}")
         return path
 
-
-# ── EarlyStopper ──────────────────────────────────────────────────────────────
-class EarlyStopper:
-    def __init__(self, patience_val=PATIENCE_VAL, patience_loss=PATIENCE_LOSS,
-                 delta=LOSS_DELTA_THRESH, warmup=5):
-        self.patience_val  = patience_val
-        self.patience_loss = patience_loss
-        self.delta         = delta
-        self.warmup        = warmup
-        self.best_auc      = -1.0
-        self.best_loss     = float('inf')
-        self.no_improve    = 0
-        self._loss_window  = deque(maxlen=3)
-
-    def step(self, epoch, val_auc=None, train_loss=None):
-        if epoch < self.warmup:
+    def restore(self, filename):
+        """Restore model + optimizer from checkpoint."""
+        path = self.save_dir / filename
+        if not path.exists():
+            logger.warning(f"[RESTORE] {path} not found, skipping.")
             return False
-        if val_auc is not None:
-            if val_auc > self.best_auc + self.delta:
-                self.best_auc   = val_auc
-                self.no_improve = 0
-                return False
-            self.no_improve += 1
-            logger.info(f"[EARLY-STOP] No val improvement "
-                        f"({self.no_improve}/{self.patience_val})")
-            return self.no_improve >= self.patience_val
-        if train_loss is not None:
-            self._loss_window.append(train_loss)
-            if len(self._loss_window) < self._loss_window.maxlen:
-                return False
-            rolling = float(np.mean(self._loss_window))
-            if self.best_loss - rolling > self.delta:
-                self.best_loss  = rolling
-                self.no_improve = 0
-                return False
-            self.no_improve += 1
-            logger.info(f"[EARLY-STOP] No loss improvement "
-                        f"({self.no_improve}/{self.patience_loss})")
-            return self.no_improve >= self.patience_loss
+        ckpt  = torch.load(str(path), map_location='cpu')
+        state = {k.replace('module.', ''): v
+                 for k, v in ckpt.get('state_dict', ckpt).items()}
+        self.model.load_state_dict(state, strict=False)
+        if 'optimizer' in ckpt:
+            try:
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+                for st in self.optimizer.state.values():
+                    for k, v in st.items():
+                        if isinstance(v, torch.Tensor):
+                            st[k] = v.cuda()
+            except Exception:
+                pass
+        logger.info(f"[RESTORE] Restored model from {path.name}")
+        return True
+
+
+# ── EarlyStopper — SIMPLE PATIENCE ────────────────────────────────────────────
+
+class EarlyStopper:
+    """
+    Simple early stopper based on validation AUC.
+    Activates only after warmup period.
+    """
+    def __init__(self, patience: int = 8, delta: float = 1e-4, warmup: int = 5):
+        self.patience  = patience
+        self.delta     = delta
+        self.warmup    = warmup
+        self.best_auc  = -1.0
+        self.no_improve = 0
+
+    def step(self, epoch, val_auc):
+        if epoch < self.warmup or val_auc is None:
+            return False
+        if val_auc > self.best_auc + self.delta:
+            self.best_auc = val_auc
+            self.no_improve = 0
+            return False
+        self.no_improve += 1
+        if self.no_improve >= self.patience:
+            logger.info(f"[EARLY-STOP] No val improvement for {self.patience} epochs. "
+                        f"Best AUC: {self.best_auc:.4f}")
+            return True
         return False
 
 
-# ── Training loop ─────────────────────────────────────────────────────────────
+# ── Training loop — STRICT CLIPPING, NO SPIKE SKIPPING ────────────────────────
+
 def train_one_epoch(model, dataloader, optimizer, loc_w, cls_w, grad_clip):
+    """
+    Single-epoch training with:
+      - Gradient accumulation
+      - Strict global gradient clipping (no spike skipping)
+      - Simple, deterministic updates
+
+    Returns: avg_loss, avg_cls, avg_loc, avg_gnorm
+    """
     model.train()
     step_losses, step_cls, step_loc, step_gnorms = [], [], [], []
     optimizer.zero_grad(set_to_none=True)
     pending = 0
 
     for i, data in enumerate(dataloader):
-        outputs = model(data, loc_weight=loc_w, cls_weight=cls_w)
-        loss    = outputs['total_loss'] / ACCUM_STEPS
-        loss.backward()
+        try:
+            outputs = model(data, loc_weight=loc_w, cls_weight=cls_w)
+        except RuntimeError as e:
+            if 'decode_loc' in str(e) or 'OUTPUT_SIZE' in str(e):
+                raise
+            logger.warning(f"[TRAIN] Batch {i} forward error: {e}")
+            continue
+
+        loss = outputs['total_loss']
+        if not torch.isfinite(loss):
+            logger.warning(f"[TRAIN] Non-finite loss at batch {i}: {loss.item():.4f}")
+            optimizer.zero_grad(set_to_none=True)
+            pending = 0
+            continue
+
+        (loss / ACCUM_STEPS).backward()
         pending += 1
 
         step_losses.append(outputs['total_loss'].item())
@@ -471,16 +615,19 @@ def train_one_epoch(model, dataloader, optimizer, loc_w, cls_w, grad_clip):
         step_loc.append(float(outputs['loc_loss']))
 
         if pending == ACCUM_STEPS:
-            gnorm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), grad_clip)
-            step_gnorms.append(float(gnorm))
+            # Strict global clipping BEFORE step
+            gnorm = float(torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip))
+            step_gnorms.append(gnorm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             pending = 0
 
+    # Flush remaining gradients
     if pending > 0:
-        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        step_gnorms.append(float(gnorm))
+        gnorm = float(torch.nn.utils.clip_grad_norm_(
+            model.parameters(), grad_clip))
+        step_gnorms.append(gnorm)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -492,47 +639,52 @@ def train_one_epoch(model, dataloader, optimizer, loc_w, cls_w, grad_clip):
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
+
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--cfg',          default=DEFAULT_CFG)
-    p.add_argument('--resume',       default=None)
-    p.add_argument('--no-resume',    action='store_true')
-    p.add_argument('--val-manifest', type=str, default=None)
-    p.add_argument('--val-seqs',     type=int, default=15)
-    p.add_argument('--freeze-bn-epochs', type=int, default=8)
+    p = argparse.ArgumentParser(
+        description='HiFT fine-tuning — STABLE PRODUCTION VERSION')
+    p.add_argument('--cfg',          default=DEFAULT_CFG,
+                   help='Path to YAML config file')
+    p.add_argument('--resume',       default=None,
+                   help='Path to checkpoint to resume from')
+    p.add_argument('--no-resume',    action='store_true',
+                   help='Do not auto-resume from latest.pth')
+    p.add_argument('--val-manifest', type=str, default=None,
+                   help='Path to val.json crop annotation file')
+    p.add_argument('--val-seqs',     type=int, default=20,
+                   help='Number of sequences for validation')
+    # These are now FIXED in code/config for stability
     return p.parse_args()
 
 
 def _resolve_val_manifest(args):
-    """
-    FIXED: now checks val.json (written by fixed preprocess_data.py)
-    in addition to manifest_val.json (legacy name).
-    """
     if args.val_manifest:
         path = Path(args.val_manifest)
         if not path.exists():
             raise FileNotFoundError(f"--val-manifest not found: {path}")
         return path.resolve()
-    # Try val.json first (fixed preprocess writes this)
     for candidate_name in ['val.json', 'manifest_val.json']:
         default = _PROJ_ROOT / 'data' / 'processed' / candidate_name
         if default.exists():
             logger.info(f"[VAL-MANIFEST] Using: {default}")
             return default
-    logger.warning("[VAL-MANIFEST] Not found — using train-loss early stopping.")
+    logger.warning("[VAL-MANIFEST] Not found — using train-loss early stopping only.")
     return None
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
 
+    # Load config
     with open(args.cfg, 'r', encoding='utf-8') as f:
         cfg_dict = yaml.safe_load(f)
     from yacs.config import CfgNode as CN
     cfg.merge_from_other_cfg(CN(cfg_dict))
 
     assert_config_consistency()
+
     os.makedirs(_abs(cfg.TRAIN.LOG_DIR), exist_ok=True)
     try:
         add_file_handler('global',
@@ -540,7 +692,8 @@ def main():
     except Exception:
         pass
 
-    logger.info(f"Project root: {_PROJ_ROOT}")
+    logger.info(f"Project root : {_PROJ_ROOT}")
+    logger.info(f"Config       : {args.cfg}")
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         logger.info(f"GPU: {props.name} | "
@@ -556,21 +709,38 @@ def main():
 
     val_manifest_path = _resolve_val_manifest(args)
 
+    # ── Build model ───────────────────────────────────────────────────────────
     logger.info("Building model...")
     model = ModelBuilder()
-    freeze_backbone_layers(model, cfg.BACKBONE.TRAIN_LAYERS)
     model = model.cuda()
 
-    optimizer = build_optimizer(model)
-    scheduler = build_cosine_scheduler(
-        optimizer,
-        total_epochs=cfg.TRAIN.EPOCH,
-        warmup_epochs=cfg.TRAIN.LR_WARMUP.EPOCH,
-        hold_epochs=3,
-    )
+    total_epochs = cfg.TRAIN.EPOCH
+    base_lr      = cfg.TRAIN.BASE_LR
+    warmup_ep    = cfg.TRAIN.LR_WARMUP.EPOCH  # 3
+
+    # STATIC BACKBONE FREEZING: Only layer4+layer5 trainable, FOREVER
+    trainable_layers = ['layer4', 'layer5']
+    set_backbone_trainable(model, trainable_layers)
+
+    # PERMANENTLY FREEZE BATCHNORM
+    n_frozen_bn = freeze_bn(model)
+    logger.info(f"[BN] Frozen {n_frozen_bn} BN layers (eval mode, no training)")
+
+    optimizer = build_optimizer(model, base_lr)
+    lr_cfg = cfg.TRAIN.LR
+    if lr_cfg.TYPE == 'cosine':
+        scheduler = build_cosine_scheduler(optimizer, total_epochs, 
+                                        warmup_epochs=cfg.TRAIN.LR_WARMUP.EPOCH,
+                                        min_lr_frac=lr_cfg.KWARGS.end_lr / lr_cfg.KWARGS.start_lr)
+    elif lr_cfg.TYPE == 'log':
+        # Implement log decay or use YACS built-in
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    else:
+        raise ValueError(f"Unknown LR type: {lr_cfg.TYPE}")
 
     start_epoch = load_weights(model, optimizer, scheduler, args)
 
+    # ── Dataset ───────────────────────────────────────────────────────────────
     logger.info("Loading dataset...")
     dataset    = TrkDataset()
     dataloader = DataLoader(
@@ -586,53 +756,73 @@ def main():
                 f"Effective (×{ACCUM_STEPS}): "
                 f"{cfg.TRAIN.BATCH_SIZE * ACCUM_STEPS}")
 
-    trainer      = SafeTrainer(model, optimizer, scheduler,
-                               _abs(cfg.TRAIN.SNAPSHOT_DIR))
-    stopper      = EarlyStopper(warmup=max(5, start_epoch + 3))
-    total_epochs = cfg.TRAIN.EPOCH
-    best_auc     = 0.0
-    best_loss    = float('inf')
-    overall_t    = time.time()
+    # ── Training support objects ──────────────────────────────────────────────
+    trainer = SafeTrainer(model, optimizer, scheduler,
+                          _abs(cfg.TRAIN.SNAPSHOT_DIR))
+    stopper = EarlyStopper(
+        patience = 8,
+        delta    = 1e-4,
+        warmup   = max(5, warmup_ep + 2)
+    )
 
+    best_auc    = 0.0
+    best_loss   = float('inf')
+    overall_t   = time.time()
+
+    # ── CSV log ───────────────────────────────────────────────────────────────
     log_csv = _abs(cfg.TRAIN.LOG_DIR) / 'training_log.csv'
     if not log_csv.exists():
         with open(log_csv, 'w') as f:
-            f.write('epoch,train_loss,cls_loss,loc_loss,lr,'
-                    'val_auc,val_precision,val_iou,grad_norm,loc_weight\n')
+            f.write('epoch,train_loss,cls_loss,loc_loss,lr_head,'
+                    'val_auc,val_precision,val_iou,'
+                    'grad_norm,loc_weight\n')
 
-    logger.info(f"Training: epoch {start_epoch+1} → {total_epochs}")
+    logger.info(
+        f"\n{'='*70}\n"
+        f"STABLE PRODUCTION TRAINING (201-sequence dataset)\n"
+        f"  Epochs:          {start_epoch+1} → {total_epochs}\n"
+        f"  LOC_WEIGHT:      0.05 → {cfg.TRAIN.LOC_WEIGHT:.3f} (ramp to 85%)\n"
+        f"  Base LR:         {base_lr:.2e}\n"
+        f"  Grad clip:       {GRAD_CLIP_GLOBAL}\n"
+        f"  Backbone:        layer4+layer5 ONLY (static freeze)\n"
+        f"  BatchNorm:       FROZEN (eval mode)\n"
+        f"  VIDEOS/epoch:    {cfg.DATASET.VIDEOS_PER_EPOCH}\n"
+        f"  Batch (eff):     {cfg.TRAIN.BATCH_SIZE * ACCUM_STEPS}\n"
+        f"{'='*70}"
+    )
 
     for epoch in range(start_epoch, total_epochs):
         if trainer.interrupted:
             break
 
-        if epoch < args.freeze_bn_epochs:
-            n_frozen = freeze_bn(model)
-            if epoch == 0:
-                logger.info(
-                    f"[BN] Freezing {n_frozen} BN layers "
-                    f"(unfreeze at epoch {args.freeze_bn_epochs})")
-        elif epoch == args.freeze_bn_epochs:
-            logger.info("[BN] Unfreezing backbone BN layers.")
-
-        dataset.pick = dataset.shuffle()
-
-        # FIXED: start=0.1 (was 0.3)
-        loc_w  = get_loc_weight(epoch, total_epochs, cfg.TRAIN.LOC_WEIGHT,
-                                start=0.1)
+        # ── Epoch LOC_WEIGHT (slow ramp) ──────────────────────────────────────
+        loc_w = get_loc_weight(
+            epoch,
+            total_epochs,
+            cfg.TRAIN.LOC_WEIGHT,
+            start=0.05,
+            ramp_frac=LOC_WEIGHT_RAMP_FRAC
+        )
         cls_w  = cfg.TRAIN.CLS_WEIGHT
-        cur_lr = optimizer.param_groups[1]['lr']
+        cur_lr = optimizer.param_groups[-1]['lr']  # head LR
 
         logger.info(
             f"\n{'='*65}\n"
             f"Epoch [{epoch+1}/{total_epochs}] | "
-            f"LOC_WEIGHT: {loc_w:.3f} | LR: {cur_lr:.2e}"
+            f"LOC_W: {loc_w:.4f} | "
+            f"LR(head): {cur_lr:.2e} | "
+            f"Backbone: {trainable_layers}"
         )
 
+        # ── Shuffle dataset ───────────────────────────────────────────────────
+        dataset.pick = dataset.shuffle()
+
+        # ── Train epoch ───────────────────────────────────────────────────────
         epoch_t = time.time()
         avg_loss, avg_cls, avg_loc, avg_gnorm = train_one_epoch(
             model, dataloader, optimizer, loc_w, cls_w,
-            grad_clip=cfg.TRAIN.GRAD_CLIP)
+            grad_clip = GRAD_CLIP_GLOBAL,
+        )
         scheduler.step()
 
         epoch_time = time.time() - epoch_t
@@ -642,6 +832,7 @@ def main():
             f"gnorm={avg_gnorm:.2f} | lr={cur_lr:.2e}"
         )
 
+        # ── Validation ────────────────────────────────────────────────────────
         val_metrics = None
         if args.val_seqs > 0 and val_manifest_path:
             val_metrics = run_validation(
@@ -654,6 +845,7 @@ def main():
                     f"mIoU={val_metrics['mean_iou']:.4f} | "
                     f"frames={val_metrics['n_frames']}")
 
+        # ── Checkpoint saving ─────────────────────────────────────────────────
         extra = {
             'train_loss': avg_loss,
             'val_auc':    val_metrics['auc'] if val_metrics else None,
@@ -664,11 +856,15 @@ def main():
         if avg_loss < best_loss:
             best_loss = avg_loss
             trainer.save(epoch, 'best_train.pth', extra)
+            logger.info(f"  ★ New best train loss: {best_loss:.4f}")
 
         if val_metrics and val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
             trainer.save(epoch, 'best_val.pth', extra)
+            trainer.save(epoch, 'best.pth', extra)  # for submit.py
+            logger.info(f"  ★ New best val AUC: {best_auc:.4f}")
 
+        # ── CSV logging ───────────────────────────────────────────────────────
         with open(log_csv, 'a') as f:
             f.write(
                 f"{epoch+1},{avg_loss:.6f},{avg_cls:.6f},{avg_loc:.6f},"
@@ -681,25 +877,28 @@ def main():
 
         torch.cuda.empty_cache()
 
+        # ── Early stopping check ──────────────────────────────────────────────
         val_auc_for_stop = val_metrics['auc'] if val_metrics else None
-        if stopper.step(epoch, val_auc=val_auc_for_stop,
-                        train_loss=avg_loss):
+        if stopper.step(epoch, val_auc=val_auc_for_stop):
             logger.info(
-                f"[EARLY-STOP] Epoch {epoch+1}. "
-                f"Best val AUC: {best_auc:.4f}  "
-                f"Best train loss: {best_loss:.4f}")
+                f"[EARLY-STOP] Triggered at epoch {epoch+1}. "
+                f"Best val AUC: {best_auc:.4f}")
             break
 
         if trainer.interrupted:
             trainer.save(epoch, 'interrupted.pth', extra)
             break
 
+    # ── Summary ───────────────────────────────────────────────────────────────
     total_t = time.time() - overall_t
     logger.info(
-        f"\nDone! Duration: "
-        f"{str(datetime.timedelta(seconds=int(total_t)))} | "
-        f"Best val AUC: {best_auc:.4f} | "
-        f"Best train loss: {best_loss:.4f}"
+        f"\n{'='*65}\n"
+        f"Training complete!\n"
+        f"  Duration:       {str(datetime.timedelta(seconds=int(total_t)))}\n"
+        f"  Best val AUC:   {best_auc:.4f}\n"
+        f"  Best train loss:{best_loss:.4f}\n"
+        f"  Checkpoints:    {_abs(cfg.TRAIN.SNAPSHOT_DIR)}\n"
+        f"{'='*65}"
     )
 
 

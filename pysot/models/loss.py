@@ -86,14 +86,25 @@ class IOULoss(nn.Module):
         inter_h = (torch.min(pred_y2, tgt_y2) - torch.max(pred_y1, tgt_y1)).clamp(min=0)
         inter   = inter_w * inter_h
 
-        # FIX: clamp union to avoid NaN from 0/0
+        # ===== normal IoU =====
         union = (tgt_area + pred_area - inter).clamp(min=1e-6)
-        ious  = (inter / union).clamp(min=0)
+        ious  = (inter / union).clamp(0.0, 1.0)
+
+        # ===== FIX: empty box semantics =====
+        empty_pred = pred_area < 1e-6
+        empty_tgt  = tgt_area < 1e-6
+        both_empty = empty_pred & empty_tgt
+
+        # if both boxes are empty → treat as perfect match
+        ious = torch.where(both_empty, torch.ones_like(ious), ious)
+
         losses = 1.0 - ious
 
+        # ===== weighting =====
         if weight is not None:
-            # weight: (B, N) — same shape as losses
-            weight = weight.view(losses.size())
+            assert weight.shape == losses.shape, \
+                f"Weight {weight.shape} != losses {losses.shape}"
+
             w_sum = weight.sum()
             if w_sum > 0:
                 return (losses * weight).sum() / (w_sum + 1e-6)
