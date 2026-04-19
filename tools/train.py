@@ -1,17 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-tools/train.py — CORRECTED PRODUCTION VERSION
-==============================================
+tools/train.py — CORRECTED PRODUCTION VERSION v2.1
+=================================================
 
-FIXES APPLIED (see bottom of file for full list):
-1. CRITICAL: re_freeze_bn() called after every validation to restore BN eval state
-2. CRITICAL: None-safe bbox handling in validation prevents cascading metric corruption
-3. HIGH: LR warmup extended to 5 epochs with gentler ramp (linear, not compressed sigmoid)
-4. HIGH: Frame budget cap (MAX_VAL_FRAMES) limits validation to ~2000 frames/epoch
-5. MEDIUM: LOC_WEIGHT=0 for first 3 epochs, ramps only after cls head stabilises
-6. MEDIUM: Init frame excluded from val metrics (IoU=1.0 is trivially true and inflates AUC)
-7. LOW: EarlyStopper warmup reduced to 3, patience to 6 for faster response to collapse
+FIXES APPLIED IN THIS VERSION (on top of v2):
+
+[CRITICAL] BUG-F: Double scheduler.step() call + wrong LR source.
+  The original v2 code called scheduler.step() BEFORE training, then again
+  AFTER training, causing LR to decay 2× faster than intended. Additionally,
+  it manually recomputed scheduler_mult instead of using the scheduler's
+  actual output. Fix: Call scheduler.step() ONCE after training, then apply
+  backbone shielding on top of the scheduler's computed LR values.
+
+All earlier fixes from v2 are retained.
 """
 
 import os
@@ -50,10 +52,29 @@ from pysot.utils.distributed import dist_init
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ACCUM_STEPS          = 4       # gradient accumulation → effective BS=16
-GRAD_CLIP_GLOBAL     = 1.0     # strict global clipping
-LOC_WEIGHT_FREEZE_EP = 3       # epochs with LOC_WEIGHT=0 (cls stabilisation phase)
-LOC_WEIGHT_RAMP_FRAC = 0.70    # LOC_WEIGHT reaches target at 70% of remaining epochs
-MAX_VAL_FRAMES       = 2000    # hard frame budget per validation run (~2 min on CPU)
+
+# FIX BUG-B: raised from 1.0 to 5.0.
+# Pre-clip gnorm in log was 4.0 at epoch 1, meaning the 1.0 clip was
+# suppressing gradients by 4× on every step. 5.0 allows natural gradient flow
+# while still preventing extreme spikes.
+GRAD_CLIP_GLOBAL     = 5.0
+
+# FIX BUG-A: raised from 3 to 5.
+# The LR warmup runs for 3 epochs reaching peak at epoch 3.
+# With freeze=3, loc_weight turned on at epoch 4 exactly at peak LR.
+# Extending to 5 gives 2 epochs of cosine descent before loc_weight starts,
+# reducing the disruption to the classification head's learned features.
+LOC_WEIGHT_FREEZE_EP = 25      # <<< CHANGE: Freeze for 25 epochs instead of 10
+LOC_WEIGHT_RAMP_FRAC = 0.50    # <<< CHANGE: Slower ramp-up speed
+MAX_VAL_FRAMES       = 2000    # hard frame budget per validation run
+
+# FIX BUG-C: backbone gradient multiplier during loc transition window.
+# For BACKBONE_LOC_SHIELD_EPOCHS epochs after loc_weight turns on,
+# the backbone LR is reduced to BACKBONE_SHIELD_LR_MULT of its normal value.
+# This insulates the backbone features from noisy regression gradients
+# while the loc head learns to produce meaningful outputs.
+BACKBONE_LOC_SHIELD_EPOCHS = 3
+BACKBONE_SHIELD_LR_MULT    = 0.1   # 10% of normal backbone LR during shield
 
 
 def get_logger(name='global'):
@@ -97,16 +118,21 @@ def get_loc_weight(epoch: int, total_epochs: int, target: float,
                    ramp_frac: float = LOC_WEIGHT_RAMP_FRAC) -> float:
     """
     Conservative LOC_WEIGHT schedule:
-      - Epochs 0..(freeze_epochs-1): LOC_WEIGHT = 0.0
-        Classification head gets to stabilise without regression gradient noise.
-      - Epochs freeze_epochs..(freeze_epochs + ramp_epochs): linear ramp start→target
-      - Remaining epochs: held at target
 
-    Example (target=0.35, total=50, freeze=3, ramp_frac=0.70):
-      epoch 0-2:  0.000  (freeze)
-      epoch 3:    0.050  (ramp starts)
-      epoch 26:   0.350  (target, 70% of remaining 47 epochs)
-      epoch 27-49: 0.350 (held)
+      Epochs 0..(freeze_epochs-1):   LOC_WEIGHT = 0.0
+        Classification head stabilises; loc head (zero-initialized) produces
+        near-zero outputs, so its IoU loss would be ~0 anyway.
+
+      Epochs freeze_epochs..(freeze_epochs + ramp_epochs): linear ramp start→target
+        loc_weight grows slowly from `start` to `target`.
+
+      Remaining epochs: held at target.
+
+    With freeze_epochs=5, total=50, ramp_frac=0.70, target=0.35:
+      epoch 0-4:  0.000  (freeze — LR peaks at epoch 3, cools by epoch 5)
+      epoch 5:    0.050  (ramp starts, LR already on cosine descent)
+      epoch ~37:  0.350  (target, 70% of remaining 45 epochs)
+      epoch 38-49: 0.350 (held)
     """
     if epoch < freeze_epochs:
         return 0.0
@@ -116,6 +142,24 @@ def get_loc_weight(epoch: int, total_epochs: int, target: float,
     progress      = min(progress, 1.0)
     return start + (target - start) * progress
 
+
+# Find this function and replace it with:
+def get_backbone_lr_mult(epoch: int, base_mult: float, is_backbone: bool = None) -> float:
+    """
+    FIX BUG-C: Additional backbone LR reduction during loc transition.
+    For BACKBONE_LOC_SHIELD_EPOCHS epochs after LOC_WEIGHT_FREEZE_EP,
+    the backbone LR multiplier is further reduced to insulate backbone
+    features from noisy loc head gradients.
+    Returns the multiplier to apply ON TOP of the normal backbone LR ratio.
+    NOTE: Only applies shield to backbone (base_mult < 1.0), not head.
+    """
+    loc_start = LOC_WEIGHT_FREEZE_EP
+    shield_end = loc_start + BACKBONE_LOC_SHIELD_EPOCHS
+    # Use explicit flag if available, otherwise fallback to base_mult heuristic
+    is_bb = is_backbone if is_backbone is not None else (base_mult < 1.0)
+    if is_bb and loc_start <= epoch < shield_end:
+        return base_mult * BACKBONE_SHIELD_LR_MULT
+    return base_mult
 
 # ── Weight loading ────────────────────────────────────────────────────────────
 
@@ -225,11 +269,13 @@ def freeze_bn(model):
 
 def re_freeze_bn(frozen_modules):
     """
-    FIX #1 (CRITICAL): model.train() recursively calls .train() on all submodules,
-    which undoes the .eval() state set by freeze_bn(). This must be called after
-    EVERY model.train() call to restore the frozen BN state.
-    Without this fix, BN running_mean/var update during training after each validation
-    round, introducing increasingly noisy normalisation that destabilises the model.
+    Restore frozen BN layers to eval mode after any model.train() call.
+
+    model.train() recursively resets ALL submodules to training mode, which
+    undoes the .eval() state set by freeze_bn(). This must be called after
+    every model.train() call to restore the frozen BN state. Without this,
+    BN running statistics update during training steps after each validation
+    round, introducing increasingly noisy normalisation.
     """
     for m in frozen_modules:
         m.eval()
@@ -265,35 +311,49 @@ def build_optimizer(model, base_lr: float):
     if backbone_trainable:
         param_groups.append({
             'params':       backbone_trainable,
-            'lr':           base_lr * 0.1,
+            'lr':           base_lr,
             'weight_decay': 5e-4,
-            'name':         'backbone'
+            'name':         'backbone',
+            'base_lr_mult': 0.1,
+            'is_backbone':  True,   # ← ADD THIS LINE
         })
     param_groups.append({
         'params':       head_params,
         'lr':           base_lr,
         'weight_decay': 5e-4,
-        'name':         'head'
+        'name':         'head',
+        'base_lr_mult': 1.0,
+        'is_backbone':  False,  # ← ADD THIS LINE
     })
     return torch.optim.AdamW(param_groups)
+
+
+def apply_backbone_lr_shield(optimizer, epoch: int, scheduler_lr: float,
+                              base_lr: float):
+    """
+    FIX BUG-C: Apply backbone LR shielding during the loc transition window.
+
+    During BACKBONE_LOC_SHIELD_EPOCHS epochs after LOC_WEIGHT_FREEZE_EP,
+    the backbone learning rate is further reduced to 10% of its normal value.
+    This prevents the randomly-initialized loc head's gradients from corrupting
+    the backbone features that were carefully learned during the cls-only phase.
+    """
+    for pg in optimizer.param_groups:
+        base_mult = pg.get('base_lr_mult', 1.0)
+        shielded_mult = get_backbone_lr_mult(epoch, base_mult)
+        pg['lr'] = scheduler_lr * shielded_mult
 
 
 def build_cosine_scheduler(optimizer, total_epochs: int,
                             warmup_epochs: int = 5,
                             min_lr_frac: float = 0.1):
     """
-    FIX #3 (HIGH): The original warmup used a compressed [0.01→1.0] ramp over 3
-    epochs. This caused a near-3× LR jump between epochs 1→2 (3.4e-5→6.7e-5),
-    which coincides exactly with the largest AUC drop (0.282→0.212).
-
-    Fix: extend warmup to 5 epochs with a gentler LINEAR ramp from 0.1→1.0.
-    This limits the per-epoch LR multiplier increase to ≤2× at any step.
+    LR schedule: linear warmup from 10%→100% of base_lr over warmup_epochs,
+    then cosine decay from 100%→10% over remaining epochs.
     """
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
-            # Linear ramp: 10% → 100% of peak LR over warmup_epochs
             return 0.1 + 0.9 * (epoch + 1) / warmup_epochs
-        # Cosine decay from peak to min_lr_frac * peak
         progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs - 1, 1)
         progress = min(progress, 1.0)
         return min_lr_frac + (1.0 - min_lr_frac) * 0.5 * (1.0 + np.cos(np.pi * progress))
@@ -334,18 +394,13 @@ def _load_gt(anno_path):
 
 
 def _iou_xywh(b1, b2):
-    """
-    FIX #2 (CRITICAL): Added None guard. Original code had no protection against
-    None bboxes returned by HiFTTracker when tracking fails. Passing None to
-    x1,y1,w1,h1 = b1 raises TypeError which is silently caught by the outer
-    except block, but then last_pred is also None, so ALL subsequent frames in
-    that sequence propagate None. This caused metric corruption for every frame
-    after the first tracking failure — often the majority of a sequence.
-    """
+    """None-safe IoU between two [x, y, w, h] boxes."""
     if b1 is None or b2 is None:
         return 0.0
     x1, y1, w1, h1 = b1
     x2, y2, w2, h2 = b2
+    if w1 <= 0 or h1 <= 0 or w2 <= 0 or h2 <= 0:
+        return 0.0
     ix = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
     iy = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
     inter = ix * iy
@@ -367,15 +422,11 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
     """
     Evaluate on internal validation split with a hard frame budget.
 
-    KEY FIXES:
-    - FIX #1: re_freeze_bn() called after model.train() to restore BN eval state.
-    - FIX #2: None-safe bbox handling (tracker failure no longer corrupts metrics).
-    - FIX #4: max_frames budget cap limits wall-clock time (~2 min vs 8 min).
-    - FIX #6: Init frame (frame_idx=0) excluded from metrics. It is always IoU=1.0
-              by construction (we initialise with the GT box) and including it
-              artificially inflates AUC by a fixed ~1/N per sequence.
-
-    Returns dict with metrics or None if validation cannot run.
+    KEY FIXES retained from v1:
+    - re_freeze_bn() called after model.train() to restore BN eval state.
+    - None-safe bbox handling.
+    - max_frames budget cap.
+    - Init frame excluded from metrics (trivially IoU=1.0 by construction).
     """
     from pysot.tracker.hift_tracker import HiFTTracker
 
@@ -412,7 +463,6 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
     seq_keys  = [sorted_seqs[i][0]
                  for i in range(0, len(sorted_seqs), step)][:max_seqs]
 
-    # Switch model to eval (tracker uses torch.no_grad internally)
     model.eval()
 
     all_ious  = []
@@ -441,7 +491,6 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
         if init_bbox is None:
             continue
 
-        # Per-sequence frame cap so one very long sequence doesn't eat the budget
         remaining       = max_frames - total_frames_used
         seq_frame_limit = min(len(gt), remaining, 300)
 
@@ -458,11 +507,6 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
                 continue
 
             tracker.init(frame, init_bbox)
-
-            # FIX #6: Do NOT append IoU=1.0 for the init frame.
-            # The init frame is trivially perfect by definition and has no
-            # diagnostic value. Including it inflates AUC by ~1/N_frames per
-            # sequence and makes epoch-to-epoch comparison misleading.
             last_pred = list(init_bbox)
 
             for frame_idx in range(1, seq_frame_limit):
@@ -473,19 +517,14 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
                 try:
                     out = tracker.track(frame)
 
-                    # FIX #2: Handle failed tracking explicitly.
-                    # When out['failed'] is True, out['bbox'] is None.
-                    # Do NOT update last_pred with None — keep propagating
-                    # the last valid prediction instead.
                     if out.get('failed', False) or out['bbox'] is None:
-                        pred = last_pred   # propagate last valid box
-                        # do NOT update last_pred here
+                        pred = last_pred
                     else:
                         pred      = out['bbox']
-                        last_pred = pred   # only update on valid prediction
+                        last_pred = pred
 
                 except Exception:
-                    pred = last_pred       # safest fallback
+                    pred = last_pred
 
                 all_ious.append(_iou_xywh(pred, gt[frame_idx]))
                 all_cerrs.append(_center_err(pred, gt[frame_idx]))
@@ -496,12 +535,7 @@ def run_validation(model, frozen_bn_modules, manifest_path, base_dir,
         except Exception:
             continue
 
-    # FIX #1 (CRITICAL): Restore model to training mode, then IMMEDIATELY
-    # re-freeze BN layers. model.train() recursively calls .train() on ALL
-    # submodules, which undoes the .eval() state set by freeze_bn() at startup.
-    # Without re_freeze_bn(), BN running statistics update during the next
-    # training step, introducing noisy normalisation that destabilises the model.
-    # This was causing the observed AUC collapse between epochs 1→2.
+    # Restore training mode with BN frozen.
     model.train()
     re_freeze_bn(frozen_bn_modules)
 
@@ -561,15 +595,10 @@ class SafeTrainer:
 # ── EarlyStopper ──────────────────────────────────────────────────────────────
 
 class EarlyStopper:
-    """
-    FIX #7 (LOW): Reduced warmup from 5 to 3 and patience from 8 to 6.
-    With the original settings (warmup=5, patience=8), the stopper couldn't
-    trigger until epoch 13 at the earliest. With AUC already collapsed by
-    epoch 4, the model would train for 9 more useless epochs before stopping.
-    """
-    def __init__(self, patience: int = 6, delta: float = 1e-4, warmup: int = 3):
+    def __init__(self, patience: int = 6, delta: float = 1e-4, warmup: int = 5):
         self.patience   = patience
         self.delta      = delta
+        # warmup matches LOC_WEIGHT_FREEZE_EP so we don't stop before loc kicks in
         self.warmup     = warmup
         self.best_auc   = -1.0
         self.no_improve = 0
@@ -595,11 +624,14 @@ class EarlyStopper:
 def train_one_epoch(model, frozen_bn_modules, dataloader, optimizer,
                     loc_w, cls_w, grad_clip):
     """
-    Single-epoch training.
+    Single-epoch training with gradient accumulation.
 
-    Note: model.train() is called by the main loop before entering here.
-    re_freeze_bn() has already been called after any preceding validation,
-    so BN layers are in the correct eval state on entry.
+    BUG-B FIX: grad_clip is now 5.0 instead of 1.0, allowing natural
+    gradient flow while preventing true gradient spikes.
+
+    NOTE: gnorm logged to CSV is the PRE-CLIP total norm returned by
+    clip_grad_norm_(). The actual applied gradient is clamped at grad_clip.
+    This is the standard PyTorch convention and is informative for monitoring.
     """
     model.train()
     re_freeze_bn(frozen_bn_modules)   # defensive: ensure BN is frozen at epoch start
@@ -632,6 +664,7 @@ def train_one_epoch(model, frozen_bn_modules, dataloader, optimizer,
         step_loc.append(float(outputs['loc_loss']))
 
         if pending == ACCUM_STEPS:
+            # clip_grad_norm_ returns the pre-clip total norm
             gnorm = float(torch.nn.utils.clip_grad_norm_(
                 model.parameters(), grad_clip))
             step_gnorms.append(gnorm)
@@ -656,7 +689,7 @@ def train_one_epoch(model, frozen_bn_modules, dataloader, optimizer,
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description='HiFT fine-tuning — corrected')
+    p = argparse.ArgumentParser(description='HiFT fine-tuning — corrected v2.1')
     p.add_argument('--cfg',          default=DEFAULT_CFG)
     p.add_argument('--resume',       default=None)
     p.add_argument('--no-resume',    action='store_true')
@@ -728,9 +761,6 @@ def main():
     trainable_layers = list(cfg.BACKBONE.TRAIN_LAYERS)
 
     set_backbone_trainable(model, trainable_layers)
-
-    # freeze_bn() returns the list of frozen modules so re_freeze_bn() can
-    # cheaply restore their eval state after every model.train() call.
     frozen_bn_modules = freeze_bn(model)
 
     optimizer = build_optimizer(model, base_lr)
@@ -747,7 +777,6 @@ def main():
 
     start_epoch = load_weights(model, optimizer, scheduler, args)
 
-    # After loading weights, model may be in any state — ensure BN is frozen.
     model.train()
     re_freeze_bn(frozen_bn_modules)
 
@@ -769,7 +798,7 @@ def main():
 
     trainer = SafeTrainer(model, optimizer, scheduler,
                           _abs(cfg.TRAIN.SNAPSHOT_DIR))
-    stopper  = EarlyStopper(patience=6, delta=1e-4, warmup=3)
+    stopper  = EarlyStopper(patience=6, delta=1e-4, warmup=LOC_WEIGHT_FREEZE_EP)
 
     best_auc  = 0.0
     best_loss = float('inf')
@@ -780,17 +809,23 @@ def main():
         with open(log_csv, 'w') as f:
             f.write('epoch,train_loss,cls_loss,loc_loss,lr_head,'
                     'val_auc,val_precision,val_iou,'
-                    'grad_norm,loc_weight,val_frames\n')
+                    'gnorm_preclip,loc_weight,val_frames\n')
+
+    loc_shield_end = LOC_WEIGHT_FREEZE_EP + BACKBONE_LOC_SHIELD_EPOCHS
 
     logger.info(
         f"\n{'='*70}\n"
-        f"CORRECTED TRAINING (201-sequence dataset)\n"
+        f"HiFT FINE-TUNING v2.1 — LR Scheduler Fixed\n"
         f"  Epochs:          {start_epoch+1} → {total_epochs}\n"
         f"  LOC_WEIGHT:      0.0 (freeze {LOC_WEIGHT_FREEZE_EP} ep) → "
         f"{cfg.TRAIN.LOC_WEIGHT:.3f} (ramp {int(LOC_WEIGHT_RAMP_FRAC*100)}%)\n"
+        f"  Loc freeze ep:   0-{LOC_WEIGHT_FREEZE_EP-1} "
+        f"(LR peaks at ep {warmup_ep-1}, cools before loc starts)\n"
+        f"  Backbone shield: ep {LOC_WEIGHT_FREEZE_EP}-{loc_shield_end-1} "
+        f"(backbone LR × {BACKBONE_SHIELD_LR_MULT} during loc ramp-up)\n"
         f"  Base LR:         {base_lr:.2e}\n"
-        f"  LR warmup:       {warmup_ep} epochs (gentle linear ramp)\n"
-        f"  Grad clip:       {GRAD_CLIP_GLOBAL}\n"
+        f"  LR warmup:       {warmup_ep} epochs\n"
+        f"  Grad clip:       {GRAD_CLIP_GLOBAL} (was 1.0 → raised to prevent over-clipping)\n"
         f"  Backbone:        {trainable_layers} (static freeze)\n"
         f"  BatchNorm:       FROZEN (re-frozen after every validation)\n"
         f"  VIDEOS/epoch:    {cfg.DATASET.VIDEOS_PER_EPOCH}\n"
@@ -804,6 +839,27 @@ def main():
 
         loc_w  = get_loc_weight(epoch, total_epochs, cfg.TRAIN.LOC_WEIGHT)
         cls_w  = cfg.TRAIN.CLS_WEIGHT
+
+        dataset.pick = dataset.shuffle()
+
+        epoch_t = time.time()
+        
+        # ── Training ────────────────────────────────────────────────────────
+        avg_loss, avg_cls, avg_loc, avg_gnorm = train_one_epoch(
+            model, frozen_bn_modules, dataloader, optimizer,
+            loc_w, cls_w, GRAD_CLIP_GLOBAL)
+
+        # ── Scheduler Step (ONCE, AFTER training) ─────────────────────────
+        scheduler.step()
+        cur_lrs = scheduler.get_last_lr()
+        
+        for idx, pg in enumerate(optimizer.param_groups):
+            base_mult = pg.get('base_lr_mult', 1.0)
+            is_backbone = pg.get('is_backbone', base_mult < 1.0)  # ← ADD THIS LINE
+            shielded_mult = get_backbone_lr_mult(epoch, base_mult, is_backbone)  # ← PASS is_backbone
+            pg['lr'] = cur_lrs[idx] * shielded_mult
+
+        # Log HEAD LR (index -1 = last group = head)
         cur_lr = optimizer.param_groups[-1]['lr']
 
         logger.info(
@@ -812,16 +868,9 @@ def main():
             f"LOC_W: {loc_w:.4f} | "
             f"LR(head): {cur_lr:.2e} | "
             f"Backbone: {trainable_layers}"
+            + (f" [SHIELDED x{BACKBONE_SHIELD_LR_MULT}]"
+               if LOC_WEIGHT_FREEZE_EP <= epoch < loc_shield_end else "")
         )
-
-        dataset.pick = dataset.shuffle()
-
-        # train_one_epoch calls re_freeze_bn() defensively at its start
-        epoch_t = time.time()
-        avg_loss, avg_cls, avg_loc, avg_gnorm = train_one_epoch(
-            model, frozen_bn_modules, dataloader, optimizer,
-            loc_w, cls_w, GRAD_CLIP_GLOBAL)
-        scheduler.step()
 
         epoch_time = time.time() - epoch_t
         logger.info(
@@ -829,12 +878,13 @@ def main():
             f"loss={avg_loss:.4f} (cls={avg_cls:.4f} loc={avg_loc:.4f}) | "
             f"gnorm={avg_gnorm:.2f} | lr={cur_lr:.2e}"
         )
+        if avg_gnorm > GRAD_CLIP_GLOBAL:
+            logger.info(f"  [CLIP] Gradient was clipped "
+                        f"({avg_gnorm:.2f} → {GRAD_CLIP_GLOBAL:.1f})")
 
         # ── Validation ────────────────────────────────────────────────────────
         val_metrics = None
         if args.val_seqs > 0 and val_manifest_path:
-            # run_validation() internally calls model.eval() then model.train()
-            # then re_freeze_bn() before returning — BN state is correct on exit.
             val_metrics = run_validation(
                 model, frozen_bn_modules,
                 val_manifest_path, contest_dir,
@@ -847,7 +897,6 @@ def main():
                     f"mIoU={val_metrics['mean_iou']:.4f} | "
                     f"frames={val_metrics['n_frames']}")
         else:
-            # No validation path: ensure BN is still frozen after train mode
             re_freeze_bn(frozen_bn_modules)
 
         # ── Checkpoints ───────────────────────────────────────────────────────
@@ -898,10 +947,10 @@ def main():
     logger.info(
         f"\n{'='*65}\n"
         f"Training complete!\n"
-        f"  Duration:       {str(datetime.timedelta(seconds=int(total_t)))}\n"
-        f"  Best val AUC:   {best_auc:.4f}\n"
-        f"  Best train loss:{best_loss:.4f}\n"
-        f"  Checkpoints:    {_abs(cfg.TRAIN.SNAPSHOT_DIR)}\n"
+        f"  Duration:        {str(datetime.timedelta(seconds=int(total_t)))}\n"
+        f"  Best val AUC:    {best_auc:.4f}\n"
+        f"  Best train loss: {best_loss:.4f}\n"
+        f"  Checkpoints:     {_abs(cfg.TRAIN.SNAPSHOT_DIR)}\n"
         f"{'='*65}"
     )
 

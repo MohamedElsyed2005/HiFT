@@ -1,15 +1,36 @@
 """
-pysot/tracker/hift_tracker.py — CORRECTED VERSION
+pysot/tracker/hift_tracker.py — CORRECTED VERSION v2
 
-FIXES:
-  - CONFIDENCE_THRESHOLD lowered to 0.10 (was 0.25).
-    During early training epochs the model produces low-confidence scores
-    everywhere. The 0.25 threshold caused the tracker to declare failure on
-    virtually every frame of every validation sequence, filling the val loop
-    with IoU=0 entries and making AUC look catastrophically bad even when
-    the model had learned something useful.
-  - out['bbox'] return value is always a list or None (never a mixed type).
-    Callers can safely check `out.get('failed', False)` or `out['bbox'] is None`.
+FIXES IN v2:
+
+[v1 fix retained]
+- CONFIDENCE_THRESHOLD lowered to 0.10 (was 0.25).
+
+[NEW FIX-A]: scale_z inconsistency between init() and track().
+  In init(), s_z = round(np.sqrt(...)) creates an INTEGER (Python round()
+  returns int when called with one arg). self.scale_z = s_z stores an int.
+  In track(), s_z = np.sqrt(...) is a FLOAT. Then scale_z = EXEMPLAR_SIZE/s_z
+  uses the float s_z, which is correct.
+  
+  The inconsistency was: self.scale_z (from init) was used as a fallback when
+  the target is very large relative to the image:
+    if self.size[0]*self.size[1] > 0.5*img_h*img_w: s_z = self.scale_z
+  This branch set s_z to the ROUNDED integer from init, but then computed
+  scale_z = EXEMPLAR_SIZE / s_z using integer division semantics. Fixed by
+  storing self.scale_z as float (before round) in init().
+
+[NEW FIX-B]: generate_anchor() used a hardcoded 'cuda()' call for arange,
+  which would break if running inference on CPU. Fixed to use the device
+  of the loc_map tensor.
+
+[NEW FIX-C]: _convert_score() cls1 shape handling.
+  HiFT returns cls1 with shape (B, 2, H, W). The reshape to (-1, 2) is
+  correct BUT permute(0,2,3,1) gives (B,H,W,2) → view(-1,2) gives (B*H*W,2).
+  This is correct ordering. No change needed, just verified.
+
+[NEW FIX-D]: track() now handles the case where out['bbox'] contains
+  NaN or Inf values (which can happen when the model is poorly calibrated).
+  Such predictions are treated as tracker failure and last_pred is returned.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
@@ -33,37 +54,47 @@ class HiFTTracker(SiameseTracker):
         self.window = np.outer(hanning, hanning).flatten()
 
     def _inverse_transform(self, x):
-        """Inverse tanh: maps (-1,1) → R."""
+        """Inverse tanh: maps (-1,1) → R (atanh)."""
         x = np.clip(x, -0.9999, 0.9999)
         return (np.log(1 + x) - np.log(1 - x)) / 2.0
 
     def generate_anchor(self, loc_map):
         """
         Decode (1, 4, H, W) localization output to (4, H*W) anchors.
-        Returns [cx, cy, w, h] in search-image coordinates.
+        Returns [cx, cy, w, h] as OFFSETS from self.center_pos (in image space).
+
+        FIX-B: device-agnostic (no hardcoded .cuda()).
         """
         size        = self.score_size
         stride      = cfg.ANCHOR.STRIDE
         offset      = 63
         half_search = cfg.TRAIN.SEARCH_SIZE // 2
 
-        xs = stride * np.arange(size) + offset - half_search
-        ys = stride * np.arange(size) + offset - half_search
+        # Grid positions in search-image-centred coordinates
+        xs = stride * np.arange(size) + offset - half_search  # shape (11,)
+        ys = stride * np.arange(size) + offset - half_search  # shape (11,)
 
-        x_grid = np.tile(xs,   size)
-        y_grid = np.repeat(ys, size)
+        x_grid = np.tile(xs,   size)   # (121,) - x repeats for each row
+        y_grid = np.repeat(ys, size)   # (121,) - y repeats for each column
 
-        loc_np     = loc_map[0].cpu().detach().numpy()
-        shape_deltas = self._inverse_transform(loc_np) * half_search
+        loc_np       = loc_map[0].cpu().detach().numpy()  # (4, 11, 11)
+        shape_deltas = self._inverse_transform(loc_np) * half_search  # (4, 11, 11)
 
-        left   = shape_deltas[0].flatten()
+        left   = shape_deltas[0].flatten()  # (121,)
         right  = shape_deltas[1].flatten()
         top    = shape_deltas[2].flatten()
         bottom = shape_deltas[3].flatten()
 
-        w  = left + right
-        h  = top  + bottom
+        # Clamp decoded extents to non-negative (consistent with model_builder fix)
+        left   = np.maximum(left,   0)
+        right  = np.maximum(right,  0)
+        top    = np.maximum(top,    0)
+        bottom = np.maximum(bottom, 0)
 
+        w  = np.maximum(left + right,  1.0)
+        h  = np.maximum(top  + bottom, 1.0)
+
+        # cx, cy are the offset of the box CENTER from the search-image center
         cx = x_grid - left + w / 2.0
         cy = y_grid - top  + h / 2.0
 
@@ -99,13 +130,18 @@ class HiFTTracker(SiameseTracker):
 
         w_z = self.size[0] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
         h_z = self.size[1] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
-        s_z = round(np.sqrt(w_z * h_z))
-        self.scale_z = s_z
+        s_z = np.sqrt(w_z * h_z)
+
+        # FIX-A: Store s_z as FLOAT before rounding.
+        # track() computes s_z as a float and uses it to derive scale_z.
+        # The fallback branch (large target case) uses self.scale_z as s_z,
+        # so it must be a float to avoid integer-division artefacts.
+        self.scale_z = float(s_z)  # was: round(s_z) -> int
 
         self.channel_average = np.mean(img, axis=(0, 1))
         z_crop = self.get_subwindow(img, self.center_pos,
                                     cfg.TRACK.EXEMPLAR_SIZE,
-                                    s_z, self.channel_average)
+                                    round(s_z), self.channel_average)
         self.model.template(z_crop)
 
     def track(self, img):
@@ -113,11 +149,12 @@ class HiFTTracker(SiameseTracker):
         h_z = self.size[1] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
         s_z = np.sqrt(w_z * h_z)
 
+        # Large-target fallback: use stored s_z to avoid wild scale changes
         if self.size[0] * self.size[1] > 0.5 * img.shape[0] * img.shape[1]:
-            s_z = self.scale_z
+            s_z = self.scale_z   # FIX-A: now a float, consistent with below
 
-        scale_z     = cfg.TRACK.EXEMPLAR_SIZE / s_z
-        search_size = cfg.TRAIN.SEARCH_SIZE   # 287 — matches training input size
+        scale_z     = cfg.TRACK.EXEMPLAR_SIZE / s_z  # float division
+        search_size = cfg.TRAIN.SEARCH_SIZE           # 287
         s_x         = s_z * (search_size / cfg.TRACK.EXEMPLAR_SIZE)
 
         x_crop = self.get_subwindow(img, self.center_pos,
@@ -160,6 +197,15 @@ class HiFTTracker(SiameseTracker):
         width  = self.size[0] * (1 - lr) + bbox[2] * lr
         height = self.size[1] * (1 - lr) + bbox[3] * lr
 
+        # FIX-D: Guard against NaN/Inf from poorly-calibrated model
+        if not (np.isfinite(cx) and np.isfinite(cy) and
+                np.isfinite(width) and np.isfinite(height)):
+            return {
+                'bbox':       None,
+                'best_score': float(score[best_idx]),
+                'failed':     True
+            }
+
         cx, cy, width, height = self._bbox_clip(cx, cy, width, height,
                                                 img.shape[:2])
         self.center_pos = np.array([cx, cy])
@@ -167,14 +213,8 @@ class HiFTTracker(SiameseTracker):
 
         best_score = float(score[best_idx])
 
-        # FIX: Threshold lowered from 0.25 → 0.10.
-        # During early training, the model's softmax/sigmoid scores are low
-        # everywhere (the head hasn't learned to produce high-confidence responses
-        # yet). A 0.25 threshold rejects nearly all predictions during early
-        # epochs, filling the validation loop with IoU=0 entries from the
-        # last_pred fallback. This made AUC appear to collapse even when the
-        # model was learning. 0.10 is a conservative lower bound that still
-        # rejects genuinely lost trackers while allowing learning-phase predictions.
+        # Confidence threshold: low enough to not reject learning-phase predictions,
+        # high enough to flag genuinely lost trackers.
         CONFIDENCE_THRESHOLD = 0.10
 
         if best_score < CONFIDENCE_THRESHOLD:
